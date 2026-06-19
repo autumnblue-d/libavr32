@@ -25,7 +25,7 @@ extern void hid_parse_frame(u8* frame, u8 size);
 extern const volatile u8* hid_get_frame_data(void);
 
 // get the bitfield of dirty bytes
-extern const volatile u32 hid_get_frame_dirty(void);
+extern const volatile u64 hid_get_frame_dirty(void);
 
 // clear the bitfield of dirty bytes
 extern void hid_clear_frame_dirty(void);
