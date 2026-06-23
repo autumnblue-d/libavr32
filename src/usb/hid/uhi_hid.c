@@ -220,8 +220,9 @@ static void uhi_hid_report_reception(
 
   UNUSED(ep);
 
-  if ((status != UHD_TRANS_NOERROR) || (nb_transfered < 4)) {
-    return; // HID transfer aborted
+  // inverted the logic here to ensure the pipe doesn't get killed on error
+  if ((status == UHD_TRANS_NOERROR) && (nb_transfered >= 4)) {
+    hid_parse_frame(uhi_hid_dev.report, uhi_hid_dev.report_size);
   }
 
   /*
@@ -237,7 +238,6 @@ static void uhi_hid_report_reception(
   /* print_dbg(" B"); */
   /* print_byte_array(uhi_hid_dev.report, uhi_hid_dev.report_size, 1); */
 
-  hid_parse_frame(uhi_hid_dev.report, uhi_hid_dev.report_size);
 
   // wait for next transmission
   uhi_hid_start_trans_report(add);
