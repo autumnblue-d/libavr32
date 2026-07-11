@@ -679,16 +679,49 @@ void uhd_resume(void)
 	uhd_sleep_mode(UHD_STATE_IDLE);
 }
 
+#ifdef USB_HOST_HUB_SUPPORT
+// Per-address control-endpoint (pipe 0) max packet size, indexed by USB address
+// (0 = the default/enumerating address). Populated by uhd_ep0_alloc() and used
+// by uhd_ctrl_phase_setup() to resize the single shared pipe 0 to whichever
+// device the current control request targets, so devices with different
+// bMaxPacketSize0 (e.g. a 64B-EP0 grid and an 8B-EP0 nanoKONTROL2) can share
+// pipe 0 behind a hub. Addresses are 7-bit (1..127); index 0 is reused per
+// enumeration (enumeration is serialized).
+static uint8_t uhd_ep0_size_by_add[128];
+#endif
+
 bool uhd_ep0_alloc(usb_add_t add, uint8_t ep_size)
 {
 	if (ep_size < 8) {
 		return false;
 	}
 #ifdef USB_HOST_HUB_SUPPORT
+	// Remember this device's control max-packet size so uhd_ctrl_phase_setup()
+	// can restore it before a control transfer to this address.
+	uhd_ep0_size_by_add[add & 0x7F] = ep_size;
 	if (Is_uhd_pipe_enabled(0)) {
-		// Already allocated
-#error TODO Add USB address in a list
-		return true;
+		// Pipe 0 is shared across all devices in hub mode and re-pointed
+		// (address only) per-transfer in uhd_ctrl_phase_setup(). Keep the
+		// current allocation UNLESS this device's control max-packet size
+		// differs from how pipe 0 is configured right now.
+		//
+		// It used to be pinned at a fixed 64 B. That silently broke any device
+		// whose bMaxPacketSize0 is < 64 (e.g. the Korg nanoKONTROL2, EP0 == 8):
+		// its control-IN packets are 8 B, which a 64 B pipe treats as a short
+		// packet = end-of-transfer, so the multi-packet config-descriptor read
+		// stops early, payload_trans < wTotalLength, and uhc.c aborts
+		// enumeration ("does not enumerate even directly"). ASF's normal flow
+		// re-allocates pipe 0 with the real bMaxPacketSize0 at the enumeration
+		// steps (uhc.c uhd_ep0_alloc(.., dev_desc.bMaxPacketSize0)) once it is
+		// known; honour that here instead of short-circuiting.
+		if (uhd_get_pipe_size(0) == ep_size) {
+			return true; // already the right size, nothing to do
+		}
+		// Resize: tear the shared pipe down and fall through to reconfigure it
+		// at ep_size. Enumeration is serialized (one uhc_dev_enum at a time),
+		// so no other device's control transfer is in flight here.
+		uhd_disable_pipe(0);
+		uhd_unallocate_memory(0);
 	}
 #endif
 
@@ -698,11 +731,7 @@ bool uhd_ep0_alloc(usb_add_t add, uint8_t ep_size)
 			0, // endpoint 0
 			AVR32_USBB_UECFG0_EPTYPE_CONTROL,
 			AVR32_USBB_UPCFG0_PTOKEN_SETUP,
-#ifdef USB_HOST_HUB_SUPPORT
-			64, // Max size for control endpoint
-#else
-			ep_size,
-#endif
+			ep_size, // control max packet size = device's bMaxPacketSize0
 			AVR32_USBB_UECFG0_EPBK_SINGLE, 0);
 
 	uhd_allocate_memory(0);
@@ -771,8 +800,17 @@ bool uhd_ep_alloc(usb_add_t add, usb_ep_desc_t * ep_desc)
 			return false;
 		}
 
+		// Full-speed host clamp: a USB 2.0 device operating at full speed still
+		// runs bulk/interrupt endpoints in <=64B packets on the wire, even if
+		// it declares a larger high-speed wMaxPacketSize (e.g. Elektron
+		// Digitone MIDI bulk = 512). The full-speed USBB cannot allocate an
+		// oversized pipe, so cap non-isochronous endpoints at the FS maximum.
+		uint16_t max_pkt = le16_to_cpu(ep_desc->wMaxPacketSize);
+		if (ep_type != USB_EP_TYPE_ISOCHRONOUS && max_pkt > 64) {
+			max_pkt = 64;
+		}
 		uhd_configure_pipe(pipe, ep_interval, ep_addr, ep_type, ep_dir,
-				le16_to_cpu(ep_desc->wMaxPacketSize),
+				max_pkt,
 				bank, AVR32_USBB_UPCFG0_AUTOSW_MASK);
 		uhd_allocate_memory(pipe);
 		if (!Is_uhd_pipe_configured(pipe)) {
@@ -789,7 +827,7 @@ bool uhd_ep_alloc(usb_add_t add, usb_ep_desc_t * ep_desc)
 		uhd_enable_pipe_interrupt(pipe);
 		return true;
 	}
-	return false;
+	return false; // no free pipe
 }
 
 
@@ -797,8 +835,10 @@ void uhd_ep_free(usb_add_t add, usb_ep_t endp)
 {
 #ifdef USB_HOST_HUB_SUPPORT
 	if (endp == 0) {
-		// Control endpoint does not be unallocated
-#error TODO the list address must be updated
+		// Shared control pipe is not torn down per-device in hub mode (see
+		// uhd_ep0_alloc). Phase 0a: just abort an in-flight control request if
+		// it targets the device being removed. (Deferred refinement: maintain
+		// an address list to free pipe 0 once the last device disconnects.)
 		if (uhd_ctrl_request_timeout
 				&& (uhd_ctrl_request_first->add == add)) {
 			// Disable setup request if on this device
@@ -821,6 +861,22 @@ void uhd_ep_free(usb_add_t add, usb_ep_t endp)
 				continue; // Mismatch
 			}
 		}
+#ifdef USB_HOST_HUB_SUPPORT
+		// Phase 0b fix: NEVER disable/unallocate the shared control pipe 0 in
+		// hub mode, even on a free-all (endp==0xFF) for a disconnecting device.
+		// Its configured address is transient (last control transfer), so it
+		// often matches `add` here; tearing it down broke every subsequent
+		// control transfer (seen as DISCONNECT / "hub psE 01" and the second
+		// device failing to enumerate). Only abort an in-flight request for the
+		// leaving device.
+		if (pipe == 0) {
+			if (uhd_ctrl_request_timeout && uhd_ctrl_request_first
+					&& (uhd_ctrl_request_first->add == add)) {
+				uhd_ctrl_request_end(UHD_TRANS_DISCONNECT);
+			}
+			continue;
+		}
+#endif
 		// Unalloc pipe
 		uhd_disable_pipe(pipe);
 		uhd_unallocate_memory(pipe);
@@ -1315,8 +1371,16 @@ static void uhd_ctrl_phase_setup(void)
 		uhd_ctrl_request_end(UHD_TRANS_DISCONNECT);
 		return; // Endpoint not valid
 	}
-#error TODO check address in list
-	// Reconfigure USB address of pipe 0 used for all control endpoints
+	// Control requests are serialized by the uhd_setup_request FIFO, so the
+	// shared pipe 0 can be multiplexed across devices here. Before pointing it
+	// at the head request's device, resize it to that device's control
+	// max-packet size (recorded by uhd_ep0_alloc) so a device with a smaller
+	// EP0 (e.g. nanoKONTROL2, 8B) is not driven with a stale larger size left
+	// by another device (e.g. a 64B-EP0 grid). uhd_ep0_alloc() only touches the
+	// hardware when the size actually differs (else it returns immediately);
+	// the address is (re)pointed by the call below in every case.
+	uhd_ep0_alloc(uhd_ctrl_request_first->add,
+			uhd_ep0_size_by_add[uhd_ctrl_request_first->add & 0x7F]);
 	uhd_configure_address(0, uhd_ctrl_request_first->add);
 #else
 	if (!Is_uhd_pipe_enabled(0) ||
@@ -1460,11 +1524,12 @@ static void uhd_ctrl_phase_data_out(void)
 		}
 	}
 
-#ifdef USB_HOST_HUB_SUPPORT
-	// TODO
-#else
+	// Phase 0a fix: the hub-mode branch was `// TODO`, leaving ep_ctrl_size
+	// used uninitialized (it bounds bytes written to the control FIFO per
+	// packet -> corrupt control-OUT transfers). uhd_get_pipe_size(0) already
+	// returns the configured size in both modes (64B in hub mode), so query it
+	// unconditionally — matching what uhd_ctrl_phase_data_in() already does.
 	ep_ctrl_size = uhd_get_pipe_size(0);
-#endif
 
 	// Fill pipe
 	uhd_configure_pipe_token(0, AVR32_USBB_PTOKEN_OUT);

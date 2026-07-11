@@ -50,14 +50,18 @@
 #include "uhi.h"
 #include "uhc.h"
 #include <stdlib.h>
+#include <string.h> // memset() in uhc_hub_port_change()
 
 #ifndef USB_HOST_UHI
 #  error USB_HOST_UHI must be defined with unless one UHI interface in conf_usb_host.h file.
 #endif
 
-#ifdef USB_HOST_HUB_SUPPORT
-#  error The USB HUB support is not available in this revision.
-#endif
+// Phase 0a (USB_HUB_PORT_PLAN.md): hub support un-gated. The control-pipe
+// multiplexing beneath the former #error markers in usbb_host.c is functional;
+// the remaining gaps (downstream device alloc, MSC) are Phase 0b/1.
+// #ifdef USB_HOST_HUB_SUPPORT
+// #  error The USB HUB support is not available in this revision.
+// #endif
 
 // Optional UHC callbacks
 #ifndef UHC_CONNECTION_EVENT
@@ -293,14 +297,70 @@ static void uhc_connection_tree(bool b_plug, uhc_device_t* dev)
 #ifdef USB_HOST_HUB_SUPPORT
 		uhc_power_running -= dev->power;
 		if (&g_uhc_device_root != dev) {
-			// It is on a USB hub
-			dev->prev->next = dev->next;
-			dev->next->prev = dev->prev;
+			// On a USB hub: unlink from the (linear, NULL-terminated) device
+			// list. Phase 0b: guard NULL prev/next — the original code assumed
+			// a circular list and would dereference NULL at the list tail.
+			if (dev->prev != NULL) {
+				dev->prev->next = dev->next;
+			}
+			if (dev->next != NULL) {
+				dev->next->prev = dev->prev;
+			}
 			free(dev);
 		}
 #endif
 	}
 }
+
+#ifdef USB_HOST_HUB_SUPPORT
+/**
+ * \brief Phase 0b: entry point for a USB hub (UHI) driver to report a
+ * downstream port connection change.
+ *
+ * Device-list allocation must live here in uhc.c because g_uhc_device_root and
+ * uhc_connection_tree() are static to this translation unit. The hub driver
+ * (uhi_hub.c) just calls this when a downstream port reports connect/disconnect.
+ *
+ * \param hub       the hub device the port belongs to
+ * \param hub_port  1-based downstream port number
+ * \param b_plug    true = device attached, false = detached
+ */
+void uhc_hub_port_change(uhc_device_t *hub, uint8_t hub_port, bool b_plug)
+{
+	if (b_plug) {
+		uhc_device_t *nd = malloc(sizeof(uhc_device_t));
+		if (nd == NULL) {
+			Assert(false);
+			return; // out of memory: drop this port change
+		}
+		memset(nd, 0, sizeof(*nd));
+		nd->hub = hub;
+		nd->hub_port = hub_port;
+		// Insert just after the root (linear, NULL-terminated list; root->prev
+		// stays NULL). Matches the walk in uhc_enumeration_step9() and the
+		// NULL-safe unlink in uhc_connection_tree().
+		nd->prev = &g_uhc_device_root;
+		nd->next = g_uhc_device_root.next;
+		if (g_uhc_device_root.next != NULL) {
+			g_uhc_device_root.next->prev = nd;
+		}
+		g_uhc_device_root.next = nd;
+		// Run standard enumeration on the new device: resets its hub port via
+		// uhi_hub_send_reset() (nd != root), assigns an address, installs the
+		// matching UHI driver.
+		uhc_connection_tree(true, nd);
+	} else {
+		// Find the device on this (hub, port) and tear it down (unlink + free).
+		uhc_device_t *d;
+		for (d = g_uhc_device_root.next; d != NULL; d = d->next) {
+			if (d->hub == hub && d->hub_port == hub_port) {
+				uhc_connection_tree(false, d);
+				break;
+			}
+		}
+	}
+}
+#endif // USB_HOST_HUB_SUPPORT
 
 /**
  * \brief Device enumeration step 1
@@ -429,20 +489,24 @@ static void uhc_enumeration_step9(void)
 			| USB_REQ_TYPE_STANDARD | USB_REQ_DIR_OUT;
 	req.bRequest = USB_REQ_SET_ADDRESS;
 #ifdef USB_HOST_HUB_SUPPORT
-	uint8_t usb_addr_free = 0;
+	uint8_t usb_addr_free;
 	uhc_device_t *dev;
 
-	// Search free address
-	dev = &g_uhc_device_root;
-	while (usb_addr_free++) {
-		if (dev->address == usb_addr_free) {
-			continue;
+	// Phase 0a fix: the original `while (usb_addr_free++)` tested 0 (false) on
+	// the first pass and never entered the loop, so every device was assigned
+	// address 1 -> collision between a hub and its downstream devices. Search
+	// for the smallest USB address (1..127) not used by any device in the list.
+	for (usb_addr_free = 1; usb_addr_free < 128; usb_addr_free++) {
+		bool in_use = false;
+		for (dev = &g_uhc_device_root; dev != NULL; dev = dev->next) {
+			if (dev->address == usb_addr_free) {
+				in_use = true;
+				break;
+			}
 		}
-		if (dev->next != NULL) {
-			dev = dev->next;
-			continue;
+		if (!in_use) {
+			break;
 		}
-		break;
 	}
 	req.wValue = usb_addr_free;
 	uhc_dev_enum->address = usb_addr_free;
@@ -705,6 +769,16 @@ static void uhc_enumeration_step14(
 
 		case UHC_ENUM_UNSUPPORTED:
 			break;
+
+#ifdef USB_HOST_HUB_SUPPORT
+		case UHC_ENUM_SOFTWARE_LIMIT:
+			// A single-instance UHI whose slot is already taken returns this for
+			// EVERY device, including ones it doesn't handle. Treat it as "not
+			// mine" (like UNSUPPORTED) rather than a fatal abort, so a second
+			// device of a different class (e.g. a keyboard alongside a CDC grid)
+			// can still be claimed by its own driver.
+			break;
+#endif
 
 		default:
 			// USB host hardware limitation

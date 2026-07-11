@@ -2,6 +2,7 @@
 #include "compiler.h"
 #include "gpio.h"
 #include "print_funcs.h"
+#include "conf_usb_host.h" // USB_HOST_HUB_SUPPORT + hub-aware uhc_device_t layout
 #include "usb.h"
 
 /*
@@ -51,9 +52,12 @@ void usb_sof(void) {
 
 // usb end-of-enumeration callback
 void usb_enum(uhc_device_t *dev, uhc_enum_status_t status) {
-  // print_dbg("\r\n usb enumerated: ");
-  // print_dbg_hex(dev);
-  // print_dbg(" , ");
-  // print_dbg_hex(status);
-
+#ifdef USB_HOST_HUB_SUPPORT
+  // A device behind a hub just finished enumerating (success or final failure).
+  // pipe 0 is free again -> resume that hub's status poll so the NEXT device
+  // (e.g. a keyboard plugged after the grid) gets detected.
+  if (dev->hub != NULL) {
+    uhi_hub_poll_resume(dev->hub);
+  }
+#endif
 }

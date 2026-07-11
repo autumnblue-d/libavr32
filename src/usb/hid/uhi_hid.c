@@ -238,7 +238,6 @@ static void uhi_hid_report_reception(
   /* print_dbg(" B"); */
   /* print_byte_array(uhi_hid_dev.report, uhi_hid_dev.report_size, 1); */
 
-
   // wait for next transmission
   uhi_hid_start_trans_report(add);
 }

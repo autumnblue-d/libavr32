@@ -18,9 +18,13 @@
 #include "usb_protocol_ftdi.h"
 #include "uhi_ftdi.h"
 
-#ifdef USB_HOST_HUB_SUPPORT
-# error USB HUB support is not implemented
-#endif
+// Phase 1: FTDI (grid) kept SINGLE-INSTANCE under hub mode — one grid behind a
+// hub is the target; two serial devices at once is a later, separate effort
+// (see USB_HUB_PORT_PLAN.md Phase 2). Removing this #error lets the grid
+// enumerate through a hub alongside a different-class device (keyboard/MIDI).
+// #ifdef USB_HOST_HUB_SUPPORT
+// # error USB HUB support is not implemented
+// #endif
 
 //------ DEFINES
 #define UHI_FTDI_TIMEOUT 20

@@ -1,7 +1,7 @@
 #include "random.h"
 
 void random_seed(random_state_t *r, u32 seed) {
-    r->z = ~seed;
+    r->z = 12345;
     r->w = seed;
 }	
 

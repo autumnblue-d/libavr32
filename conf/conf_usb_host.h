@@ -11,9 +11,19 @@
 /// don't sleep
 #define UHD_NO_SLEEP_MGR
 
+// USB hub support. Enables the grid + keyboard (+ MIDI) through a powered hub.
+// See USB_HUB_PORT_PLAN.md. Comment out to build the original single-device
+// firmware.
+#define USB_HOST_HUB_SUPPORT
+
 //! Array of UHI APIs Define the list of UHI supported by USB host.
 // #define USB_HOST_UHI        UHI_FTDI , UHI_HID
+#ifdef USB_HOST_HUB_SUPPORT
+// UHI_HUB first so a hub device is claimed by the hub driver before others try.
+#define USB_HOST_UHI        UHI_HUB, UHI_FTDI, UHI_HID, UHI_MSC, UHI_MIDI, UHI_MCDC
+#else
 #define USB_HOST_UHI        UHI_FTDI, UHI_HID, UHI_MSC, UHI_MIDI, UHI_MCDC
+#endif
 
 //! Maximum current allowed on Vbus (mA)
 #define USB_HOST_POWER_MAX  500
@@ -74,6 +84,7 @@
 #define UHI_MSC_CHANGE(dev,b_plug) msc_change(dev, b_plug)
 
 
+#include "uhi_hub.h"
 #include "uhi_ftdi.h"
 #include "uhi_hid.h"
 #include "uhi_midi.h"

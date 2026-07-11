@@ -51,10 +51,11 @@
 #include "uhi_msc.h"
 #include <string.h>
 
-#ifdef USB_HOST_HUB_SUPPORT
-// TODO
-#  error USB HUB support is not implemented on UHI MSC
-#endif
+// Phase 0b (USB_HUB_PORT_PLAN.md): MSC is kept SINGLE-INSTANCE under hub mode.
+// teletype only ever mounts one USB stick (transient scene I/O), never two
+// through a hub, so the singleton uhi_msc_dev is sufficient; uhi_msc_dev_sel
+// is pointed at it in uhi_msc_enable(). (Also fixes the never-compiled syntax
+// error `&uhi_msc_dev[]` that proved this path was never built upstream.)
 
 #ifndef UHI_MSC_NOTIFY_NEW_LUN_EXT
 #  define UHI_MSC_NOTIFY_NEW_LUN_EXT
@@ -312,10 +313,9 @@ void uhi_msc_enable(uhc_device_t * dev)
 	// *It is required by specific U-disk which does not respect USB MSC norm.
 
 #ifdef USB_HOST_HUB_SUPPORT
-	uhi_msc_dev_sel = &uhi_msc_dev[];
-	if (!b_uhi_msc_free) {
-		// Install must be postponed
-	}
+	// Single-instance: point the hub-mode selector at the singleton so the
+	// uhi_msc_dev_sel-> accesses below resolve correctly.
+	uhi_msc_dev_sel = &uhi_msc_dev;
 #else
 	Assert(uhi_msc_dev.dev != NULL);
 #endif

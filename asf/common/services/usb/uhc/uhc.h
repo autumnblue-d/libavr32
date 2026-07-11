@@ -135,7 +135,10 @@ extern "C" {
 /**
  * \brief Structure to store device information
  */
-typedef struct{
+// Phase 0a fix: tag the struct so the hub-mode self-referential pointers below
+// can use `struct uhc_device *` — the `uhc_device_t` typedef name does not yet
+// exist mid-definition (the original code used it and never compiled).
+typedef struct uhc_device{
 	//! USB device descriptor
 	usb_dev_desc_t dev_desc;
 
@@ -153,9 +156,9 @@ typedef struct{
 #endif
 
 #ifdef USB_HOST_HUB_SUPPORT
-	uhc_device_t *prev;
-	uhc_device_t *next;
-	uhc_device_t *hub;
+	struct uhc_device *prev;
+	struct uhc_device *next;
+	struct uhc_device *hub;
 	// Power consumption if device or devices connected to a HUB downstream port are NUB powered
 	uint16_t power;
 	uint8_t hub_port;
@@ -344,6 +347,19 @@ uhd_speed_t uhc_dev_get_speed(uhc_device_t* dev);
  * \return True, if high speed is supported
  */
 bool uhc_dev_is_high_speed_support(uhc_device_t* dev);
+
+#ifdef USB_HOST_HUB_SUPPORT
+/**
+ * \brief Phase 0b: called by a USB hub (UHI) driver to report a downstream
+ * port connect/disconnect. UHC allocates/links (or finds/frees) the device and
+ * drives enumeration. See uhi_hub.c.
+ *
+ * \param hub       the hub device owning the port
+ * \param hub_port  1-based downstream port number
+ * \param b_plug    true = attached, false = detached
+ */
+void uhc_hub_port_change(uhc_device_t *hub, uint8_t hub_port, bool b_plug);
+#endif
 
 //@}
 

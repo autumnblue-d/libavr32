@@ -6,6 +6,7 @@
 */
 
 // asf
+#include "interrupt.h" // cpu_irq_save/restore for the TX-queue kick
 #include "print_funcs.h"
 
 // libavr32
@@ -24,7 +25,10 @@
 // the more full the buffer, the longer we'll spend in the usb read ISR parsing it...
 // so it is a tradeoff.
 #define MIDI_RX_EVENT_BUF_SIZE 16
-#define MIDI_TX_EVENT_BUF_SIZE 16
+// TX ring depth (4-byte USB-MIDI events). Absorbs bursts (e.g. Kria firing
+// several tracks + note-offs on one clock step) so notes aren't dropped while
+// the previous packet is still on the wire. 32 * 4 B = 128 B.
+#define MIDI_TX_EVENT_BUF_SIZE 32
 
 
 //------------------------------
@@ -53,6 +57,9 @@ COMPILER_WORD_ALIGNED static usb_midi_event_t txBuf[MIDI_TX_EVENT_BUF_SIZE];
 static volatile bool txBusy = false;
 static volatile u8 txGetIdx = 0;
 static volatile u8 txPutIdx = 0;
+static volatile u8 txInFlight = 0; // events in the current (batched) transfer
+
+static void midi_tx_start(void); // starts a batched transfer; caller holds txBusy
 
 // current packet data
 static event_t ev = { .type = kEventMidiPacket, .data = 0x00000000 };
@@ -70,7 +77,11 @@ static void midi_parse_event(void) {
   usb_midi_event_t* rxEvent = &(rxBuf[0]);
 
   for (i = 0; i < eventCount; i++) {
-    buf.data = (rxEvent->raw) << 8;
+    // shift the 3-byte MIDI message into bits 8..31 (as midi_packet_parse
+    // expects) and stash the virtual cable number (header high nibble) in the
+    // otherwise-unused low byte so downstream code can tell which port it came
+    // from (e.g. MIDISPORT port A = cable 0, port B = cable 1).
+    buf.data = (rxEvent->raw << 8) | (rxEvent->header >> 4);
     ev.data = buf.sdata;
     event_post(&ev);
 
@@ -93,17 +104,44 @@ static void midi_rx_done(usb_add_t add,
   rxBusy = false;
 }
 
-// callback for the non-blocking asynchronous write.
+// callback for the non-blocking asynchronous write. Runs in the USB
+// transfer-complete ISR. The packet at txGetIdx just finished (NOERROR) or
+// errored/timed out; either way advance past it and, if the ring still holds
+// queued packets, immediately start the next so a burst drains back-to-back
+// without the producer ever blocking.
 static void midi_tx_done(usb_add_t add,
                          usb_ep_t ep,
                          uhd_trans_status_t stat,
                          iram_size_t nb) {
+  (void)add;
+  (void)ep;
+  (void)nb;
   if (stat != UHD_TRANS_NOERROR) {
     print_dbg("\r\n midi tx error (in callback). status: 0x");
     print_dbg_hex((u32)stat);
   }
 
-  txBusy = false;
+  txGetIdx = (txGetIdx + txInFlight) % MIDI_TX_EVENT_BUF_SIZE;
+  txInFlight = 0;
+  if (txGetIdx != txPutIdx) {
+    midi_tx_start(); // more queued: chain the next batch (txBusy stays true)
+  } else {
+    txBusy = false; // ring drained
+  }
+}
+
+// Start a bulk transfer of the largest CONTIGUOUS run of queued events from
+// txGetIdx (not wrapping past the buffer end — the wrapped remainder rides the
+// next transfer). Batching many 4-byte events into one USB transfer is what
+// lets a dense burst drain fast enough: one event per transfer (~1 USB frame
+// each) can't keep up with Kria's bursts, so the ring overflowed and dropped
+// note-ons. Caller must already hold txBusy and ensure the ring is non-empty.
+static void midi_tx_start(void) {
+  u8 run = (txPutIdx >= txGetIdx) ? (u8)(txPutIdx - txGetIdx)
+                                  : (u8)(MIDI_TX_EVENT_BUF_SIZE - txGetIdx);
+  txInFlight = run;
+  uhi_midi_out_run((uint8_t*)&txBuf[txGetIdx],
+                   run * sizeof(usb_midi_event_t), &midi_tx_done);
 }
 
 
@@ -227,27 +265,43 @@ extern bool midi_write(const u8* data, u32 bytes) {
 
   return true;
 }
+// Queue a 4-byte USB-MIDI packet for transmission (non-blocking).
+//
+// Writes the next TX ring slot and, only if no transfer is in flight, kicks one
+// off; otherwise the midi_tx_done ISR chains this packet after the in-flight
+// one. This replaces the previous implementation, which handed a *local stack*
+// buffer to the asynchronous DMA and spin-waited AFTER writing it — so a rapid
+// second call (e.g. Kria firing several tracks on one clock step) clobbered the
+// first packet's in-flight buffer, corrupting/dropping notes.
 extern void midi_write_packet(u8 cable_number, u8 *pack) {
-  if(!midi_connected) {
+  if (!midi_connected) {
     return;
   }
-  uint8_t txBuf[4] = {
-    pack[0] >> 4,
-    pack[0],
-    pack[1],
-    pack[2]
-  };
-  txBuf[0] |= (cable_number << 4) & 0xf0;
-  while (txBusy) {
-    if(!midi_connected) {
-      txBusy = false;
-      return;
-    }
+  u8 next = (txPutIdx + 1) % MIDI_TX_EVENT_BUF_SIZE;
+  if (next == txGetIdx) {
+    // Ring full: drop this packet rather than block or corrupt an in-flight one.
+    print_dbg("\r\n midi tx queue full, dropping packet");
+    return;
   }
+  // USB-MIDI event: header = (cable << 4) | CIN, CIN = status high nibble.
+  usb_midi_event_t* e = &txBuf[txPutIdx];
+  e->header = ((cable_number << 4) & 0xf0) | (pack[0] >> 4);
+  e->msg[0] = pack[0];
+  e->msg[1] = pack[1];
+  e->msg[2] = pack[2];
+  txPutIdx = next;
 
-  txBusy = true;
-  if (!uhi_midi_out_run((uint8_t*)txBuf, 4, &midi_tx_done)) {
-    print_dbg("\r\n midi tx endpoint error");
+  // Start a transfer only if the engine is idle. Test-and-set txBusy with
+  // interrupts masked so we don't race midi_tx_done (ISR) clearing it. When we
+  // win the claim no transfer is in flight, so reading txGetIdx here is safe.
+  irqflags_t flags = cpu_irq_save();
+  bool start = !txBusy;
+  if (start) {
+    txBusy = true;
+  }
+  cpu_irq_restore(flags);
+  if (start) {
+    midi_tx_start(); // batches all currently-queued events into one transfer
   }
 }
 
@@ -255,13 +309,18 @@ extern void midi_write_packet(u8 cable_number, u8 *pack) {
 extern void midi_change(uhc_device_t* dev, u8 plug) {
   event_t e;
 
-  if (plug) { 
+  if (plug) {
     midi_connected = true;
     rxBusy = false;
     txBusy = false;
+    txGetIdx = txPutIdx = 0; // reset the TX ring
+    txInFlight = 0;
     e.type = kEventMidiConnect;
   } else {
     midi_connected = false;
+    txBusy = false;
+    txGetIdx = txPutIdx = 0; // drop anything queued for the departed device
+    txInFlight = 0;
     e.type = kEventMidiDisconnect;
   }
 
