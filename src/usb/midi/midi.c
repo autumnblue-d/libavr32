@@ -52,12 +52,26 @@ COMPILER_WORD_ALIGNED static usb_midi_event_t rxBuf[MIDI_RX_EVENT_BUF_SIZE];
 static volatile bool rxBusy = false;
 static u32 rxBytes = 0;
 
-// try using an output buffer and adding the extra nib we saw on input ... 
+// try using an output buffer and adding the extra nib we saw on input ...
 COMPILER_WORD_ALIGNED static usb_midi_event_t txBuf[MIDI_TX_EVENT_BUF_SIZE];
 static volatile bool txBusy = false;
 static volatile u8 txGetIdx = 0;
 static volatile u8 txPutIdx = 0;
 static volatile u8 txInFlight = 0; // events in the current (batched) transfer
+
+// System Real-Time messages (Clock/Start/Continue/Stop, status >= 0xF8) get
+// their own ring, drained ahead of the normal ring by midi_tx_start(). This
+// keeps transport/clock bytes from (a) being dropped when a note burst has
+// filled the normal ring and (b) sitting behind that burst — the spec expects
+// realtime bytes to reach the wire with minimal jitter. A realtime message
+// still can't preempt a transfer already on the wire, but it goes out on the
+// very next one. 8 * 4 B = 32 B; ample since these drain ~1 event/USB frame.
+#define MIDI_RT_EVENT_BUF_SIZE 8
+COMPILER_WORD_ALIGNED static usb_midi_event_t rtBuf[MIDI_RT_EVENT_BUF_SIZE];
+static volatile u8 rtGetIdx = 0;
+static volatile u8 rtPutIdx = 0;
+static volatile u8 rtInFlight = 0; // realtime events in the current transfer
+static volatile bool rtActive = false; // is the in-flight transfer from rtBuf?
 
 static void midi_tx_start(void); // starts a batched transfer; caller holds txBusy
 
@@ -121,12 +135,17 @@ static void midi_tx_done(usb_add_t add,
     print_dbg_hex((u32)stat);
   }
 
-  txGetIdx = (txGetIdx + txInFlight) % MIDI_TX_EVENT_BUF_SIZE;
-  txInFlight = 0;
-  if (txGetIdx != txPutIdx) {
+  if (rtActive) {
+    rtGetIdx = (rtGetIdx + rtInFlight) % MIDI_RT_EVENT_BUF_SIZE;
+    rtInFlight = 0;
+  } else {
+    txGetIdx = (txGetIdx + txInFlight) % MIDI_TX_EVENT_BUF_SIZE;
+    txInFlight = 0;
+  }
+  if (rtGetIdx != rtPutIdx || txGetIdx != txPutIdx) {
     midi_tx_start(); // more queued: chain the next batch (txBusy stays true)
   } else {
-    txBusy = false; // ring drained
+    txBusy = false; // both rings drained
   }
 }
 
@@ -137,6 +156,17 @@ static void midi_tx_done(usb_add_t add,
 // each) can't keep up with Kria's bursts, so the ring overflowed and dropped
 // note-ons. Caller must already hold txBusy and ensure the ring is non-empty.
 static void midi_tx_start(void) {
+  // Realtime ring first: transport/clock bytes jump ahead of queued notes.
+  if (rtGetIdx != rtPutIdx) {
+    u8 run = (rtPutIdx > rtGetIdx) ? (u8)(rtPutIdx - rtGetIdx)
+                                   : (u8)(MIDI_RT_EVENT_BUF_SIZE - rtGetIdx);
+    rtInFlight = run;
+    rtActive = true;
+    uhi_midi_out_run((uint8_t*)&rtBuf[rtGetIdx],
+                     run * sizeof(usb_midi_event_t), &midi_tx_done);
+    return;
+  }
+  rtActive = false;
   u8 run = (txPutIdx >= txGetIdx) ? (u8)(txPutIdx - txGetIdx)
                                   : (u8)(MIDI_TX_EVENT_BUF_SIZE - txGetIdx);
   txInFlight = run;
@@ -277,19 +307,35 @@ extern void midi_write_packet(u8 cable_number, u8 *pack) {
   if (!midi_connected) {
     return;
   }
-  u8 next = (txPutIdx + 1) % MIDI_TX_EVENT_BUF_SIZE;
-  if (next == txGetIdx) {
-    // Ring full: drop this packet rather than block or corrupt an in-flight one.
-    print_dbg("\r\n midi tx queue full, dropping packet");
-    return;
+  // System Real-Time (status >= 0xF8) uses the priority ring; everything else
+  // the normal ring. A full realtime ring is near-impossible in practice (it
+  // drains a message per USB frame), but if it happens we still drop rather
+  // than clobber an in-flight buffer.
+  bool is_realtime = pack[0] >= 0xF8;
+  usb_midi_event_t* e;
+  if (is_realtime) {
+    u8 next = (rtPutIdx + 1) % MIDI_RT_EVENT_BUF_SIZE;
+    if (next == rtGetIdx) {
+      print_dbg("\r\n midi tx realtime queue full, dropping packet");
+      return;
+    }
+    e = &rtBuf[rtPutIdx];
+    rtPutIdx = next;
+  } else {
+    u8 next = (txPutIdx + 1) % MIDI_TX_EVENT_BUF_SIZE;
+    if (next == txGetIdx) {
+      // Ring full: drop rather than block or corrupt an in-flight one.
+      print_dbg("\r\n midi tx queue full, dropping packet");
+      return;
+    }
+    e = &txBuf[txPutIdx];
+    txPutIdx = next;
   }
   // USB-MIDI event: header = (cable << 4) | CIN, CIN = status high nibble.
-  usb_midi_event_t* e = &txBuf[txPutIdx];
   e->header = ((cable_number << 4) & 0xf0) | (pack[0] >> 4);
   e->msg[0] = pack[0];
   e->msg[1] = pack[1];
   e->msg[2] = pack[2];
-  txPutIdx = next;
 
   // Start a transfer only if the engine is idle. Test-and-set txBusy with
   // interrupts masked so we don't race midi_tx_done (ISR) clearing it. When we
@@ -315,12 +361,18 @@ extern void midi_change(uhc_device_t* dev, u8 plug) {
     txBusy = false;
     txGetIdx = txPutIdx = 0; // reset the TX ring
     txInFlight = 0;
+    rtGetIdx = rtPutIdx = 0; // reset the realtime ring
+    rtInFlight = 0;
+    rtActive = false;
     e.type = kEventMidiConnect;
   } else {
     midi_connected = false;
     txBusy = false;
     txGetIdx = txPutIdx = 0; // drop anything queued for the departed device
     txInFlight = 0;
+    rtGetIdx = rtPutIdx = 0;
+    rtInFlight = 0;
+    rtActive = false;
     e.type = kEventMidiDisconnect;
   }
 
