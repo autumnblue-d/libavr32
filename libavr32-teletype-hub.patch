@@ -1,0 +1,251 @@
+# libavr32-teletype-hub.patch
+#
+# USB-hub support hardening for Teletype: enumerate hub-attached devices at their
+# true (hub-reported) speed, and cleanly reject low-speed devices behind a hub
+# (which the full-speed-only UC3B USBB host cannot service) instead of looping.
+# Combined patch: Teletype module file + the libavr32 hub driver, in one file.
+#
+# ---------------------------------------------------------------------------
+# PREREQUISITE
+#   The libavr32 submodule MUST be on the `hub-snapshot` branch
+#   (github.com/autumnblue-d/libavr32), which provides src/usb/hub/uhi_hub.{c,h}.
+#   On stock monome/libavr32 (main) this patch references files that do not
+#   exist and will NOT build.
+#
+# APPLY  (run from the Teletype repo root)
+#   # 1. put the libavr32 submodule on hub-snapshot
+#   cd libavr32
+#   git remote add hub https://github.com/autumnblue-d/libavr32.git   # once
+#   git fetch hub && git checkout hub-snapshot
+#   cd ..
+#   # 2. apply this combined patch (touches module/ AND libavr32/). This file
+#   #    ships on the hub-snapshot branch, so from the Teletype root it is at
+#   #    libavr32/libavr32-teletype-hub.patch:
+#   git apply libavr32/libavr32-teletype-hub.patch
+#
+# VERIFY IT APPLIES FIRST (optional, no changes made)
+#   git apply --check libavr32/libavr32-teletype-hub.patch
+#
+# BUILD  (AVR32 toolchain via Docker; add --platform linux/amd64 on Apple Silicon)
+#   docker run --rm --platform linux/amd64 -v "$(pwd)":/target \
+#       dewb/monome-build 'cd module && make clean && make'
+#   -> produces module/teletype.{elf,hex,bin}
+#
+# FILES CHANGED
+#   module/config.mk                         compile uhi_hub.c + add its include path
+#   libavr32/asf/.../uhc/uhc.c               per-device speed + low-speed reject
+#   libavr32/src/usb/hub/uhi_hub.c           port-speed capture + reject mask
+#   libavr32/src/usb/hub/uhi_hub.h           new declarations
+#   libavr32/USB_HUB_HOW_IT_WORKS.md         known-limitation note (AVR4950 cite)
+#
+# BEHAVIOUR: hub-attached devices enumerate at the speed the hub reports for
+# their port (not the bus-wide uhd_get_speed()); a low-speed device behind a hub
+# is detected and rejected once (its port is flagged so it is not re-enumerated
+# in a loop; the flag clears on disconnect), while full-speed devices on other
+# ports keep working. There is NO on-screen debug code in this patch.
+#
+# NOTE: this is a plain `git apply` patch (paths relative to the Teletype root,
+# including into the libavr32 submodule working tree). Do NOT use `git apply
+# --index` across the submodule boundary. The trilogy-branch flash.c reseed
+# fixes are NOT part of this patch (they are specific to that branch's layout).
+# ---------------------------------------------------------------------------
+diff --git a/module/config.mk b/module/config.mk
+index 49a9cac..cf3d290 100644
+--- a/module/config.mk
++++ b/module/config.mk
+@@ -145,6 +145,7 @@ CSRCS = \
+ 	../libavr32/src/usb/ftdi/uhi_ftdi.c			\
+ 	../libavr32/src/usb/hid/hid.c				\
+ 	../libavr32/src/usb/hid/uhi_hid.c			\
++	../libavr32/src/usb/hub/uhi_hub.c			\
+ 	../libavr32/src/usb/midi/uhi_midi.c			\
+ 	../libavr32/src/usb/midi/midi.c				\
+ 	../libavr32/src/usb/msc/msc.c				\
+@@ -186,6 +187,7 @@ INC_PATH = \
+ 	../src/usb/cdc						\
+ 	../src/usb/ftdi						\
+ 	../src/usb/hid						\
++	../src/usb/hub						\
+ 	../src/usb/midi						\
+ 	../src/usb/msc						\
+ 	../conf							\
+diff --git a/libavr32/USB_HUB_HOW_IT_WORKS.md b/libavr32/USB_HUB_HOW_IT_WORKS.md
+index 9f86b67..14390fe 100644
+--- a/libavr32/USB_HUB_HOW_IT_WORKS.md
++++ b/libavr32/USB_HUB_HOW_IT_WORKS.md
+@@ -259,10 +259,31 @@ Two keyboard fixes (ported from Daanyal Baber's work, `#79`/`#80`) live in
+ 
+ ## Known limitations
+ 
++- **Low-speed devices are not supported behind a hub** (hardware limit — no
++  firmware fix). The UC3B USBB host cannot service a low-speed (1.5 Mbit/s)
++  device that shares a tree with a full-speed hub: it can neither generate the
++  low-speed PRE preamble nor mix speeds on one tree. Atmel documents this
++  directly — AVR4950 *"ASF USB Host Stack"* (doc 8486A), §8 "USB HUB support",
++  Table 8‑1, for the USBB: *"Does not support multiple USB speeds in same time
++  on a USB tree."* A low-speed device works only when connected **directly** to
++  the module (the whole bus then runs low-speed); behind a hub it cannot work,
++  because a USB hub is itself always a full-speed/high-speed device.
++  - Practical impact: **Apple aluminium USB keyboards** put their key matrix on
++    a low-speed HID device *behind the keyboard's own built-in hub*, so they can
++    never enumerate here — even plugged in "directly." **Use a full-speed USB
++    keyboard instead** (full-speed HID keyboards work fine, including behind the
++    hub).
++  - Handling: such a device is detected at enumeration (the hub reports its port
++    speed) and **rejected cleanly** — the port is flagged so it is not
++    re-enumerated in a loop (which used to reset→reject→reset forever and leak a
++    `uhc_device_t` each round), the flag clears on disconnect, and other ports
++    keep working. See `uhi_hub.c` (`uhi_hub_reject_ls`, port `rejected` mask) and
++    `uhc.c` `uhc_enumeration_step4`.
+ - Disconnect isn't detected while another device is mid-enumeration (poll is
+   paused).
+-- Failed/looping enumerations can leak a `uhc_device_t` (address climbs);
+-  power-cycle resets it.
++- Failed/looping enumerations from *other* causes can still leak a
++  `uhc_device_t` (address climbs); power-cycle resets it. (The low-speed-behind-
++  hub loop specifically is now handled — see the first bullet.)
+ - 3 simultaneous devices is at the UC3B pipe ceiling — grid+keyboard+MIDI fits,
+   more may not.
+ - Simultaneous power-on of two devices can race the global `uhc_dev_enum`; plug
+diff --git a/libavr32/asf/common/services/usb/uhc/uhc.c b/libavr32/asf/common/services/usb/uhc/uhc.c
+index f5b25d3..8fa4a0d 100644
+--- a/libavr32/asf/common/services/usb/uhc/uhc.c
++++ b/libavr32/asf/common/services/usb/uhc/uhc.c
+@@ -396,6 +396,24 @@ static void uhc_enumeration_step3(void)
+ static void uhc_enumeration_step4(void)
+ {
+ 	uhc_dev_enum->speed = uhd_get_speed();
++#ifdef USB_HOST_HUB_SUPPORT
++	if (&g_uhc_device_root != uhc_dev_enum) {
++		// Device behind a hub: uhd_get_speed() reports the HUB's link speed, not
++		// this device's. Use the speed the hub reported for the port at reset.
++		uhc_dev_enum->speed = uhi_hub_get_reset_speed();
++		if (uhc_dev_enum->speed == UHD_SPEED_LOW) {
++			// The full-speed-only UC3B USBB host cannot reach a low-speed device
++			// through a full-speed hub (it has no PRE-preamble / per-pipe
++			// low-speed support). Reject cleanly instead of enumerating at the
++			// wrong speed: no retries (which would re-reset and re-fail), and no
++			// address consumed (rejection happens before SET_ADDRESS).
++			uhi_hub_reject_ls(uhc_dev_enum);
++			uhc_enum_try = UHC_ENUM_NB_TRY; // skip retries -> go straight to give-up
++			uhc_enumeration_error(UHC_ENUM_UNSUPPORTED);
++			return;
++		}
++	}
++#endif
+ 	uhc_enable_timeout_callback(100, uhc_enumeration_step5);
+ }
+ 
+diff --git a/libavr32/src/usb/hub/uhi_hub.c b/libavr32/src/usb/hub/uhi_hub.c
+index b4d14de..027f3ed 100644
+--- a/libavr32/src/usb/hub/uhi_hub.c
++++ b/libavr32/src/usb/hub/uhi_hub.c
+@@ -55,6 +55,12 @@ typedef struct {
+ 	uint8_t reset_port;            // port currently being reset
+ 	uint8_t reset_polls;           // GET_STATUS poll count (bounds the wait)
+ 
++	// Ports holding a device we already rejected as unsupported (low-speed behind
++	// a full-speed hub). Bit (port-1). Cleared when that port reports disconnect.
++	// Stops the reset->reject->reset loop that would otherwise re-malloc a
++	// uhc_device_t every round (uhc_hub_port_change does not dedupe on connect).
++	uint8_t rejected;
++
+ 	// Word-aligned for USBB DMA (matches COMPILER_WORD_ALIGNED in the other UHI
+ 	// drivers). status_change: bitmap, bit0=hub, bit n=port n.
+ 	COMPILER_WORD_ALIGNED uint8_t status_change[4];
+@@ -63,6 +69,29 @@ typedef struct {
+ 
+ static uhi_hub_t hubs[UHI_HUB_MAX];
+ 
++//--------------------------------------------------------------------+
++// Downstream device speed (low-speed-behind-hub fix)
++//--------------------------------------------------------------------+
++
++// Speed the hub reported for the most-recently-reset downstream port. ASF
++// enumerates one device at a time (global uhc_dev_enum), so one value suffices.
++static uhd_speed_t hub_reset_speed = UHD_SPEED_FULL;
++
++uhd_speed_t uhi_hub_get_reset_speed(void) { return hub_reset_speed; }
++
++// forward decl: defined below, near the other get_hub_by_* helpers
++static uhi_hub_t* get_hub_by_dev(uhc_device_t* dev);
++
++// Mark `dev`'s downstream port as an unsupported low-speed device. Marking the
++// port stops uhc.c from re-enumerating it in a loop (see `rejected` above); the
++// bit is cleared when the device disconnects.
++void uhi_hub_reject_ls(uhc_device_t* dev) {
++	uhi_hub_t* hub = get_hub_by_dev(dev->hub);
++	if (hub != NULL && dev->hub_port >= 1 && dev->hub_port <= UHI_HUB_MAX_PORTS) {
++		hub->rejected |= (uint8_t)(1u << (dev->hub_port - 1));
++	}
++}
++
+ // Recover the hub for a control-transfer completion callback. uhd passes
+ // `uhd_get_configured_address(0)` (pipe 0's current address), which can be some
+ // other device's address once transfers interleave on the shared pipe. With
+@@ -321,6 +350,23 @@ static void on_conn_change_cleared(usb_add_t add, uhd_trans_status_t status,
+ 	if (hub == NULL || status != UHD_TRANS_NOERROR) return;
+ 
+ 	bool connected = hub->ctrl_buf[0] & 0x01; // current status.connection
++	uint8_t port_bit = (hub->cur_port >= 1 && hub->cur_port <= UHI_HUB_MAX_PORTS)
++	                       ? (uint8_t)(1u << (hub->cur_port - 1))
++	                       : 0;
++
++	if (connected && (hub->rejected & port_bit)) {
++		// This port holds a device we already rejected (unsupported low-speed
++		// device behind a full-speed hub). Re-enumerating it just resets ->
++		// rejects -> resets forever and leaks a uhc_device_t each round, so
++		// leave it alone. A reset can re-assert the connection-change bit, which
++		// is exactly what used to drive that loop. Ignore until it disconnects.
++		hub_start_status_poll(hub);
++		return;
++	}
++	if (!connected) {
++		// Device gone: allow this port to enumerate again next time.
++		hub->rejected &= (uint8_t)~port_bit;
++	}
+ 
+ 	// Hand off to the UHC entry point (uhc.c), which owns the device list and
+ 	// enumeration. On connect it allocates + links a uhc_device_t and enumerates
+@@ -379,7 +425,16 @@ static void on_reset_poll(usb_add_t add, uhd_trans_status_t status, uint16_t n)
+ 
+ 	// port status response: change word is bytes [2..3]; reset = bit 4 -> 0x10.
+ 	if (hub->ctrl_buf[2] & 0x10) {
+-		// Reset complete; port is enabled. Ack the change, then resume enum.
++		// Reset complete; port is enabled. The hub reports the attached device's
++		// speed in the STATUS word (bytes [0..1]): bit 9 = low-speed, bit 10 =
++		// high-speed, neither = full-speed. Capture it so uhc.c can set the
++		// device's speed from what the hub saw, instead of uhd_get_speed() (the
++		// hub's own full-speed link). Valid now: the port is enabled post-reset.
++		uint16_t pstat = hub->ctrl_buf[0] | ((uint16_t)hub->ctrl_buf[1] << 8);
++		if (pstat & (1u << 9))       hub_reset_speed = UHD_SPEED_LOW;
++		else if (pstat & (1u << 10)) hub_reset_speed = UHD_SPEED_HIGH;
++		else                         hub_reset_speed = UHD_SPEED_FULL;
++		// Ack the change, then resume enum.
+ 		port_clear_feature(hub->dev->address, hub->reset_port,
+ 		                   HUB_FEAT_PORT_RESET_CHANGE, on_reset_cleared);
+ 	} else if (++hub->reset_polls < 50) {
+diff --git a/libavr32/src/usb/hub/uhi_hub.h b/libavr32/src/usb/hub/uhi_hub.h
+index 2aa9ad3..2071501 100644
+--- a/libavr32/src/usb/hub/uhi_hub.h
++++ b/libavr32/src/usb/hub/uhi_hub.h
+@@ -75,4 +75,19 @@ extern void uhi_hub_suspend(uhc_device_t* dev);
+ // the shared pipe 0; resuming here lets the next device be detected.
+ extern void uhi_hub_poll_resume(uhc_device_t* hub_dev);
+ 
++// --- Downstream device speed (low-speed-behind-hub fix) ---
++//
++// A device behind a hub attaches at its own speed, which the hub reports in the
++// port status word at reset. The USBB bus speed (uhd_get_speed()) is the HUB's
++// link speed, not the device's, so uhc.c must ask the hub instead. Returns the
++// speed captured at the most recent downstream port reset (ASF enumerates one
++// device at a time, so a single value suffices).
++extern uhd_speed_t uhi_hub_get_reset_speed(void);
++
++// The full-speed-only UC3B USBB host cannot drive a LOW-speed device through a
++// full-speed hub (no PRE-preamble support). uhc.c calls this to reject `dev`:
++// it marks the device's downstream port so it is not re-enumerated in a loop
++// (the mark clears on disconnect).
++extern void uhi_hub_reject_ls(uhc_device_t* dev);
++
+ #endif // _USB_UHI_HUB_H_
