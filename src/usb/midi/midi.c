@@ -331,8 +331,20 @@ extern void midi_write_packet(u8 cable_number, u8 *pack) {
     e = &txBuf[txPutIdx];
     txPutIdx = next;
   }
-  // USB-MIDI event: header = (cable << 4) | CIN, CIN = status high nibble.
-  e->header = ((cable_number << 4) & 0xf0) | (pack[0] >> 4);
+  // USB-MIDI event: header = (cable << 4) | CIN. For channel-voice messages
+  // (0x8-0xE) and system-real-time (0xF8-0xFF, single byte) the status high
+  // nibble already equals the correct CIN. The 3-byte / 2-byte system-common
+  // messages (0xF2 SPP; 0xF1 MTC / 0xF3 song-select) are the exception -- their
+  // nibble is 0xF, so give them their spec CIN or a strict host drops the data
+  // bytes.
+  u8 cin;
+  if (pack[0] == 0xF2)
+    cin = 0x3;  // song position pointer: 3-byte system common
+  else if (pack[0] == 0xF1 || pack[0] == 0xF3)
+    cin = 0x2;  // MTC quarter-frame / song select: 2-byte system common
+  else
+    cin = pack[0] >> 4;
+  e->header = ((cable_number << 4) & 0xf0) | cin;
   e->msg[0] = pack[0];
   e->msg[1] = pack[1];
   e->msg[2] = pack[2];
