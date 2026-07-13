@@ -55,6 +55,12 @@ typedef struct {
 	uint8_t reset_port;            // port currently being reset
 	uint8_t reset_polls;           // GET_STATUS poll count (bounds the wait)
 
+	// Ports holding a device we already rejected as unsupported (low-speed behind
+	// a full-speed hub). Bit (port-1). Cleared when that port reports disconnect.
+	// Stops the reset->reject->reset loop that would otherwise re-malloc a
+	// uhc_device_t every round (uhc_hub_port_change does not dedupe on connect).
+	uint8_t rejected;
+
 	// Word-aligned for USBB DMA (matches COMPILER_WORD_ALIGNED in the other UHI
 	// drivers). status_change: bitmap, bit0=hub, bit n=port n.
 	COMPILER_WORD_ALIGNED uint8_t status_change[4];
@@ -62,6 +68,29 @@ typedef struct {
 } uhi_hub_t;
 
 static uhi_hub_t hubs[UHI_HUB_MAX];
+
+//--------------------------------------------------------------------+
+// Downstream device speed (low-speed-behind-hub fix)
+//--------------------------------------------------------------------+
+
+// Speed the hub reported for the most-recently-reset downstream port. ASF
+// enumerates one device at a time (global uhc_dev_enum), so one value suffices.
+static uhd_speed_t hub_reset_speed = UHD_SPEED_FULL;
+
+uhd_speed_t uhi_hub_get_reset_speed(void) { return hub_reset_speed; }
+
+// forward decl: defined below, near the other get_hub_by_* helpers
+static uhi_hub_t* get_hub_by_dev(uhc_device_t* dev);
+
+// Mark `dev`'s downstream port as an unsupported low-speed device. Marking the
+// port stops uhc.c from re-enumerating it in a loop (see `rejected` above); the
+// bit is cleared when the device disconnects.
+void uhi_hub_reject_ls(uhc_device_t* dev) {
+	uhi_hub_t* hub = get_hub_by_dev(dev->hub);
+	if (hub != NULL && dev->hub_port >= 1 && dev->hub_port <= UHI_HUB_MAX_PORTS) {
+		hub->rejected |= (uint8_t)(1u << (dev->hub_port - 1));
+	}
+}
 
 // Recover the hub for a control-transfer completion callback. uhd passes
 // `uhd_get_configured_address(0)` (pipe 0's current address), which can be some
@@ -321,6 +350,23 @@ static void on_conn_change_cleared(usb_add_t add, uhd_trans_status_t status,
 	if (hub == NULL || status != UHD_TRANS_NOERROR) return;
 
 	bool connected = hub->ctrl_buf[0] & 0x01; // current status.connection
+	uint8_t port_bit = (hub->cur_port >= 1 && hub->cur_port <= UHI_HUB_MAX_PORTS)
+	                       ? (uint8_t)(1u << (hub->cur_port - 1))
+	                       : 0;
+
+	if (connected && (hub->rejected & port_bit)) {
+		// This port holds a device we already rejected (unsupported low-speed
+		// device behind a full-speed hub). Re-enumerating it just resets ->
+		// rejects -> resets forever and leaks a uhc_device_t each round, so
+		// leave it alone. A reset can re-assert the connection-change bit, which
+		// is exactly what used to drive that loop. Ignore until it disconnects.
+		hub_start_status_poll(hub);
+		return;
+	}
+	if (!connected) {
+		// Device gone: allow this port to enumerate again next time.
+		hub->rejected &= (uint8_t)~port_bit;
+	}
 
 	// Hand off to the UHC entry point (uhc.c), which owns the device list and
 	// enumeration. On connect it allocates + links a uhc_device_t and enumerates
@@ -379,7 +425,16 @@ static void on_reset_poll(usb_add_t add, uhd_trans_status_t status, uint16_t n) 
 
 	// port status response: change word is bytes [2..3]; reset = bit 4 -> 0x10.
 	if (hub->ctrl_buf[2] & 0x10) {
-		// Reset complete; port is enabled. Ack the change, then resume enum.
+		// Reset complete; port is enabled. The hub reports the attached device's
+		// speed in the STATUS word (bytes [0..1]): bit 9 = low-speed, bit 10 =
+		// high-speed, neither = full-speed. Capture it so uhc.c can set the
+		// device's speed from what the hub saw, instead of uhd_get_speed() (the
+		// hub's own full-speed link). Valid now: the port is enabled post-reset.
+		uint16_t pstat = hub->ctrl_buf[0] | ((uint16_t)hub->ctrl_buf[1] << 8);
+		if (pstat & (1u << 9))       hub_reset_speed = UHD_SPEED_LOW;
+		else if (pstat & (1u << 10)) hub_reset_speed = UHD_SPEED_HIGH;
+		else                         hub_reset_speed = UHD_SPEED_FULL;
+		// Ack the change, then resume enum.
 		port_clear_feature(hub->dev->address, hub->reset_port,
 		                   HUB_FEAT_PORT_RESET_CHANGE, on_reset_cleared);
 	} else if (++hub->reset_polls < 50) {

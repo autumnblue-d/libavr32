@@ -75,4 +75,19 @@ extern void uhi_hub_suspend(uhc_device_t* dev);
 // the shared pipe 0; resuming here lets the next device be detected.
 extern void uhi_hub_poll_resume(uhc_device_t* hub_dev);
 
+// --- Downstream device speed (low-speed-behind-hub fix) ---
+//
+// A device behind a hub attaches at its own speed, which the hub reports in the
+// port status word at reset. The USBB bus speed (uhd_get_speed()) is the HUB's
+// link speed, not the device's, so uhc.c must ask the hub instead. Returns the
+// speed captured at the most recent downstream port reset (ASF enumerates one
+// device at a time, so a single value suffices).
+extern uhd_speed_t uhi_hub_get_reset_speed(void);
+
+// The full-speed-only UC3B USBB host cannot drive a LOW-speed device through a
+// full-speed hub (no PRE-preamble support). uhc.c calls this to reject `dev`:
+// it marks the device's downstream port so it is not re-enumerated in a loop
+// (the mark clears on disconnect).
+extern void uhi_hub_reject_ls(uhc_device_t* dev);
+
 #endif // _USB_UHI_HUB_H_

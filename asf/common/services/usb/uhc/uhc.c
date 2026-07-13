@@ -396,6 +396,24 @@ static void uhc_enumeration_step3(void)
 static void uhc_enumeration_step4(void)
 {
 	uhc_dev_enum->speed = uhd_get_speed();
+#ifdef USB_HOST_HUB_SUPPORT
+	if (&g_uhc_device_root != uhc_dev_enum) {
+		// Device behind a hub: uhd_get_speed() reports the HUB's link speed, not
+		// this device's. Use the speed the hub reported for the port at reset.
+		uhc_dev_enum->speed = uhi_hub_get_reset_speed();
+		if (uhc_dev_enum->speed == UHD_SPEED_LOW) {
+			// The full-speed-only UC3B USBB host cannot reach a low-speed device
+			// through a full-speed hub (it has no PRE-preamble / per-pipe
+			// low-speed support). Reject cleanly instead of enumerating at the
+			// wrong speed: no retries (which would re-reset and re-fail), and no
+			// address consumed (rejection happens before SET_ADDRESS).
+			uhi_hub_reject_ls(uhc_dev_enum);
+			uhc_enum_try = UHC_ENUM_NB_TRY; // skip retries -> go straight to give-up
+			uhc_enumeration_error(UHC_ENUM_UNSUPPORTED);
+			return;
+		}
+	}
+#endif
 	uhc_enable_timeout_callback(100, uhc_enumeration_step5);
 }
 

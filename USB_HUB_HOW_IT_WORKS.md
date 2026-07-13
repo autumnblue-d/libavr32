@@ -259,10 +259,31 @@ Two keyboard fixes (ported from Daanyal Baber's work, `#79`/`#80`) live in
 
 ## Known limitations
 
+- **Low-speed devices are not supported behind a hub** (hardware limit — no
+  firmware fix). The UC3B USBB host cannot service a low-speed (1.5 Mbit/s)
+  device that shares a tree with a full-speed hub: it can neither generate the
+  low-speed PRE preamble nor mix speeds on one tree. Atmel documents this
+  directly — AVR4950 *"ASF USB Host Stack"* (doc 8486A), §8 "USB HUB support",
+  Table 8‑1, for the USBB: *"Does not support multiple USB speeds in same time
+  on a USB tree."* A low-speed device works only when connected **directly** to
+  the module (the whole bus then runs low-speed); behind a hub it cannot work,
+  because a USB hub is itself always a full-speed/high-speed device.
+  - Practical impact: **Apple aluminium USB keyboards** put their key matrix on
+    a low-speed HID device *behind the keyboard's own built-in hub*, so they can
+    never enumerate here — even plugged in "directly." **Use a full-speed USB
+    keyboard instead** (full-speed HID keyboards work fine, including behind the
+    hub).
+  - Handling: such a device is detected at enumeration (the hub reports its port
+    speed) and **rejected cleanly** — the port is flagged so it is not
+    re-enumerated in a loop (which used to reset→reject→reset forever and leak a
+    `uhc_device_t` each round), the flag clears on disconnect, and other ports
+    keep working. See `uhi_hub.c` (`uhi_hub_reject_ls`, port `rejected` mask) and
+    `uhc.c` `uhc_enumeration_step4`.
 - Disconnect isn't detected while another device is mid-enumeration (poll is
   paused).
-- Failed/looping enumerations can leak a `uhc_device_t` (address climbs);
-  power-cycle resets it.
+- Failed/looping enumerations from *other* causes can still leak a
+  `uhc_device_t` (address climbs); power-cycle resets it. (The low-speed-behind-
+  hub loop specifically is now handled — see the first bullet.)
 - 3 simultaneous devices is at the UC3B pipe ceiling — grid+keyboard+MIDI fits,
   more may not.
 - Simultaneous power-on of two devices can race the global `uhc_dev_enum`; plug
