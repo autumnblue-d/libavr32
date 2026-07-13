@@ -278,3 +278,46 @@ genuinely-missing pieces — a **hub class driver**, a **downstream-device
 malloc/link/enumerate path**, and a **poll-pause/resume gate** that serializes
 everything onto the single shared control pipe — while fixing ~9 latent bugs in
 never-compiled code along the way.
+
+## Reporting a hub compatibility issue
+
+When a hub or a device behind it doesn't work, the useful thing to capture is
+the **USB tree with per-device speed** plus the hub/device **descriptors** —
+because this host is full-speed-only: full-speed devices work behind a hub,
+low-speed ones do not (see the low-speed limitation above). Plug the hub in
+*exactly as used with the module* (hub + the grid / keyboard / MIDI in question)
+before running the commands.
+
+### macOS
+
+```sh
+# human-readable tree with a Speed: field per device
+system_profiler SPUSBDataType
+
+# raw descriptors, filtered to the fields that matter
+ioreg -p IOUSB -l -w0 | grep -E \
+  '\+-o |USB Product Name|USB Vendor Name|idVendor|idProduct|bDeviceClass|bDeviceSubClass|bDeviceProtocol|bcdUSB|Device Speed|bMaxPacketSize0'
+```
+`Device Speed`: **0 = low, 1 = full, 2 = high**. The `+-o` lines are the tree
+(what sits behind the hub).
+
+### Linux
+
+```sh
+lsusb -t                       # tree with per-port speed (1.5M / 12M / 480M) + driver
+lsusb                          # names + VID:PID
+sudo lsusb -v -d <VID>:<PID>   # full descriptors — run for BOTH the hub and the device
+```
+
+### What to read (and include in a report)
+
+- **Speed of each device, and whether it is behind a hub.** A device that shows
+  **low speed (1.5 Mb/s)** while behind a hub will not work here (e.g. Apple
+  keyboards — the key matrix is low-speed behind the keyboard's own hub). **Full
+  speed (12 Mb/s)** behind a hub should work.
+- **The hub's descriptor**: `bDeviceProtocol` (`0` = FS hub, `1` = single-TT,
+  `2` = multi-TT), `bcdUSB`, and port count.
+- **`bMaxPacketSize0`** of the device — flags small-EP0 devices (the
+  nanoKONTROL2 = 8 case).
+- Whether the hub is **powered** (this host can't supply bus power for several
+  downstream devices).
