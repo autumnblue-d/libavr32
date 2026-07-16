@@ -46,13 +46,30 @@ typedef enum {
 	HUB_ST_RESETTING,
 } hub_state_t;
 
+// Deferred actions run from the 1 ms SOF tick (uhi_hub_sof). This is how the
+// driver waits (bPwrOn2PwrGood settle) and retries transient failures (a full
+// uhd request FIFO, a flaky transfer) instead of dead-stalling forever.
+typedef enum {
+	HUB_SOF_NONE = 0,
+	HUB_SOF_START_POLL,   // (re)arm the status-change interrupt poll
+	HUB_SOF_RETRY_ENABLE, // re-run the enable sequence (descriptor + power)
+} hub_sof_action_t;
+
 typedef struct {
 	uhc_device_t* dev;        // the hub device itself (NULL = slot free)
 	usb_ep_t      ep_in;      // interrupt-IN status-change endpoint
-	uint8_t       nb_ports;   // from hub descriptor bNbrPorts
+	uint8_t       nb_ports;   // watched ports: min(bNbrPorts, UHI_HUB_MAX_PORTS)
+	uint8_t       pwr_ports;  // bNbrPorts as reported: ALL of them get PORT_POWER
 	uint8_t       pwr_good_2ms;
 	uint8_t       cur_port;   // port currently being serviced
 	hub_state_t   state;
+
+	uint8_t       poll_armed;     // a status-change transfer is pending
+	uint8_t       enable_retries; // bounded retry budget for the enable sequence
+
+	// SOF-driven deferred action (see hub_sof_action_t / uhi_hub_sof)
+	uint16_t      sof_delay;  // countdown in ms; 0 = idle
+	uint8_t       sof_action; // hub_sof_action_t
 
 	// downstream enumeration hand-off (uhi_hub_send_reset handshake)
 	uhd_callback_reset_t reset_cb; // enumeration continuation to invoke when done
@@ -172,6 +189,17 @@ static void on_other_change_cleared(usb_add_t add, uhd_trans_status_t status, ui
 static void on_reset_feature_set(usb_add_t add, uhd_trans_status_t status, uint16_t n);
 static void on_reset_poll(usb_add_t add, uhd_trans_status_t status, uint16_t n);
 static void on_reset_cleared(usb_add_t add, uhd_trans_status_t status, uint16_t n);
+static void on_hub_status(usb_add_t add, uhd_trans_status_t status, uint16_t n);
+static void on_hub_oc_cleared(usb_add_t add, uhd_trans_status_t status, uint16_t n);
+static void hub_enable_start(uhi_hub_t* hub);
+static void hub_enable_retry(uhi_hub_t* hub);
+
+// Schedule `action` to run `ms` milliseconds from now (from uhi_hub_sof).
+// One slot per hub: a later schedule replaces an earlier pending one.
+static void hub_sof_schedule(uhi_hub_t* hub, uint8_t action, uint16_t ms) {
+	hub->sof_action = action;
+	hub->sof_delay  = ms ? ms : 1;
+}
 
 //--------------------------------------------------------------------+
 // UHI: install  (TinyUSB: hub_open, hub.c:221-242)
@@ -209,6 +237,11 @@ uhc_enum_status_t uhi_hub_install(uhc_device_t* dev) {
 		default:
 			break;
 		}
+		if (iface->bLength == 0 || iface->bLength > conf_lgt) {
+			// Malformed descriptor: a zero bLength would loop here forever,
+			// an oversized one would underflow conf_lgt into a wild walk.
+			return UHC_ENUM_UNSUPPORTED;
+		}
 		conf_lgt -= iface->bLength;
 		iface = (usb_iface_desc_t*)((uint8_t*)iface + iface->bLength);
 	}
@@ -222,39 +255,71 @@ uhc_enum_status_t uhi_hub_install(uhc_device_t* dev) {
 void uhi_hub_enable(uhc_device_t* dev) {
 	uhi_hub_t* hub = get_hub_by_dev(dev);
 	if (hub == NULL) return;
+	hub->enable_retries = 0;
+	hub_enable_start(hub);
+}
 
-	// GET_DESCRIPTOR (hub class) -> ctrl_buf. wValue=0 per TinyUSB hub_set_config.
-	hub_ctrl(dev->address, HUB_REQTYPE_DEV_IN, HUB_REQ_GET_DESCRIPTOR,
-	         0, 0, hub->ctrl_buf, 9 /*sizeof hub_desc_cs_t*/, on_hubdesc);
+// GET_DESCRIPTOR (hub class) -> ctrl_buf. wValue carries the descriptor type
+// in the high byte (USB 2.0 11.24.2.5) — some hubs STALL a zero wValue.
+static void hub_enable_start(uhi_hub_t* hub) {
+	if (!hub_ctrl(hub->dev->address, HUB_REQTYPE_DEV_IN, HUB_REQ_GET_DESCRIPTOR,
+	              (uint16_t)(HUB_DT_HUB << 8), 0, hub->ctrl_buf,
+	              9 /*sizeof hub_desc_cs_t*/, on_hubdesc)) {
+		hub_enable_retry(hub);
+	}
+}
+
+// Transient failure in the enable sequence: retry the whole sequence a few
+// times from the SOF tick. After the budget, give up — the hub stays
+// unpolled (the pre-existing behavior, but no longer on the first hiccup).
+static void hub_enable_retry(uhi_hub_t* hub) {
+	if (++hub->enable_retries <= 3) {
+		hub_sof_schedule(hub, HUB_SOF_RETRY_ENABLE, 10);
+	}
 }
 
 // hub descriptor arrived (TinyUSB config_set_port_power, hub.c:304-321)
 static void on_hubdesc(usb_add_t add, uhd_trans_status_t status, uint16_t n) {
 	uhi_hub_t* hub = get_hub_by_addr(add);
-	if (hub == NULL || status != UHD_TRANS_NOERROR) return;
+	if (hub == NULL) return;
+	if (status != UHD_TRANS_NOERROR || n < 6) {
+		hub_enable_retry(hub);
+		return;
+	}
 
 	// hub_desc_cs_t layout: [2]=bNbrPorts, [5]=bPwrOn2PwrGood
-	hub->nb_ports     = hub->ctrl_buf[2];
 	hub->pwr_good_2ms = hub->ctrl_buf[5];
+	hub->pwr_ports    = hub->ctrl_buf[2]; // power ALL reported ports...
+	hub->nb_ports     = hub->pwr_ports;   // ...but watch at most 7 (bitmap)
 	if (hub->nb_ports > UHI_HUB_MAX_PORTS) hub->nb_ports = UHI_HUB_MAX_PORTS;
 
 	// Power port 1; on_port_power walks the rest (TinyUSB config_port_power_*).
 	hub->cur_port = 1;
-	port_set_feature(add, 1, HUB_FEAT_PORT_POWER, on_port_power);
+	if (!port_set_feature(add, 1, HUB_FEAT_PORT_POWER, on_port_power)) {
+		hub_enable_retry(hub);
+	}
 }
 
 // each PORT_POWER set completes -> power next, or finish (hub.c:323-342)
 static void on_port_power(usb_add_t add, uhd_trans_status_t status, uint16_t n) {
 	uhi_hub_t* hub = get_hub_by_addr(add);
-	if (hub == NULL || status != UHD_TRANS_NOERROR) return;
+	if (hub == NULL) return;
+	if (status != UHD_TRANS_NOERROR) {
+		hub_enable_retry(hub);
+		return;
+	}
 
-	if (hub->cur_port >= hub->nb_ports) {
-		// All ports powered. TODO: honour pwr_good_2ms delay (2ms * value)
-		// before trusting connection status — schedule via a SOF/timer.
-		hub_start_status_poll(hub);
+	if (hub->cur_port >= hub->pwr_ports) {
+		// All ports powered. Honour bPwrOn2PwrGood (2 ms units, +2 ms margin)
+		// before trusting connection status / arming the change poll.
+		hub_sof_schedule(hub, HUB_SOF_START_POLL,
+		                 (uint16_t)hub->pwr_good_2ms * 2 + 2);
 	} else {
 		hub->cur_port++;
-		port_set_feature(add, hub->cur_port, HUB_FEAT_PORT_POWER, on_port_power);
+		if (!port_set_feature(add, hub->cur_port, HUB_FEAT_PORT_POWER,
+		                      on_port_power)) {
+			hub_enable_retry(hub);
+		}
 	}
 }
 
@@ -264,18 +329,21 @@ static void on_port_power(usb_add_t add, uhd_trans_status_t status, uint16_t n) 
 //--------------------------------------------------------------------+
 static void hub_start_status_poll(uhi_hub_t* hub) {
 	// interrupt IN, 1 byte enough for <=7 ports (bit0 hub + bits 1..n ports)
+	if (hub->poll_armed) {
+		return; // already pending; double-arming would just be refused
+	}
+	if (uhd_ep_run(hub->dev->address, hub->ep_in, true,
+	               hub->status_change, 1, 0, on_status_change)) {
+		hub->poll_armed = 1;
+	}
+	else {
 #ifdef USB_TOPO_DEBUG
-	// "poll!" once per failure streak: the status poll could not be re-armed
-	// (uhd request slots exhausted / pipe gone) — hub servicing is now dead.
-	static bool poll_run_failed;
-	bool ok = uhd_ep_run(hub->dev->address, hub->ep_in, true,
-	                     hub->status_change, 1, 0, on_status_change);
-	if (!ok && !poll_run_failed) usb_dbg_push("poll!");
-	poll_run_failed = !ok;
-#else
-	uhd_ep_run(hub->dev->address, hub->ep_in, true,
-	           hub->status_change, 1, 0, on_status_change);
+		usb_dbg_push("poll!");
 #endif
+		// uhd couldn't take the transfer (request slots busy): retry from the
+		// SOF tick instead of dropping hub servicing forever.
+		hub_sof_schedule(hub, HUB_SOF_START_POLL, 2);
+	}
 }
 
 // interrupt transfer completed -> decode which port changed (hub_xfer_cb)
@@ -284,6 +352,7 @@ static void on_status_change(usb_add_t add, usb_ep_t ep,
 	(void)ep;
 	uhi_hub_t* hub = get_hub_by_addr(add);
 	if (hub == NULL) return;
+	hub->poll_armed = 0;
 
 #ifdef USB_TOPO_DEBUG
 	// Log only the FIRST error of a streak — if the error completes
@@ -312,17 +381,78 @@ static void on_status_change(usb_add_t add, usb_ep_t ep,
 		return;
 	}
 
-	// bit0 = hub-level change (over-current / power). TODO handle if needed.
+	// bit0 = hub-level change (local power / over-current): fetch hub status,
+	// clear the change bit, and re-power ports after an over-current trip —
+	// a latched hub change would otherwise re-assert the interrupt forever.
+	if (change & 0x01) {
+		if (!hub_ctrl(hub->dev->address, HUB_REQTYPE_DEV_IN, HUB_REQ_GET_STATUS,
+		              0, 0, hub->ctrl_buf, 4, on_hub_status)) {
+			hub_sof_schedule(hub, HUB_SOF_START_POLL, 2);
+		}
+		return;
+	}
 	// bits 1..n = port change. Service the first set port; re-poll after.
 	for (uint8_t port = 1; port <= hub->nb_ports; port++) {
 		if (change & (1u << port)) {
 			hub->cur_port = port;
 			hub->state    = HUB_ST_GET_PORT_STATUS;
-			port_get_status(hub, port, on_port_status);
+			if (!port_get_status(hub, port, on_port_status)) {
+				// change stays latched; the retried poll will re-report it
+				hub_sof_schedule(hub, HUB_SOF_START_POLL, 2);
+			}
 			return; // one port per pass (TinyUSB breaks here)
 		}
 	}
 	hub_start_status_poll(hub);
+}
+
+// GET_STATUS(hub) arrived: change word low byte in ctrl_buf[2]:
+// bit0 = C_HUB_LOCAL_POWER, bit1 = C_HUB_OVER_CURRENT (USB 2.0 11.24.2.6).
+static void on_hub_status(usb_add_t add, uhd_trans_status_t status, uint16_t n) {
+	uhi_hub_t* hub = get_hub_by_addr(add);
+	if (hub == NULL) return;
+	if (status != UHD_TRANS_NOERROR) {
+		hub_start_status_poll(hub);
+		return;
+	}
+
+	uint8_t chg = hub->ctrl_buf[2];
+	if (chg & 0x02) {
+		// Over-current trip: the hub has cut port power. Ack the change, then
+		// re-run the PORT_POWER walk (which ends by re-arming the poll).
+		if (!hub_ctrl(add, HUB_REQTYPE_DEV_OUT, HUB_REQ_CLEAR_FEATURE,
+		              HUB_FEAT_C_HUB_OVER_CURRENT, 0, NULL, 0,
+		              on_hub_oc_cleared)) {
+			hub_sof_schedule(hub, HUB_SOF_START_POLL, 2);
+		}
+	}
+	else if (chg & 0x01) {
+		if (!hub_ctrl(add, HUB_REQTYPE_DEV_OUT, HUB_REQ_CLEAR_FEATURE,
+		              HUB_FEAT_C_HUB_LOCAL_POWER, 0, NULL, 0,
+		              on_other_change_cleared)) {
+			hub_sof_schedule(hub, HUB_SOF_START_POLL, 2);
+		}
+	}
+	else {
+		// No hub change bit set (spurious); just resume watching.
+		hub_start_status_poll(hub);
+	}
+}
+
+// C_HUB_OVER_CURRENT acked -> ports lost power; run the power walk again.
+static void on_hub_oc_cleared(usb_add_t add, uhd_trans_status_t status,
+                              uint16_t n) {
+	uhi_hub_t* hub = get_hub_by_addr(add);
+	if (hub == NULL) return;
+#ifdef USB_TOPO_DEBUG
+	usb_dbg_push("hubOC");
+#endif
+	hub->enable_retries = 0; // fresh budget for the re-power walk
+	hub->cur_port       = 1;
+	if (!port_set_feature(hub->dev->address, 1, HUB_FEAT_PORT_POWER,
+	                      on_port_power)) {
+		hub_enable_retry(hub);
+	}
 }
 
 // GET_STATUS(port) arrived (TinyUSB process_new_status STATE_CLEAR_CHANGE,
@@ -340,26 +470,26 @@ static void on_port_status(usb_add_t add, uhd_trans_status_t status, uint16_t n)
 	// over_current[3] reset[4]. EVERY set change bit must be cleared or the hub
 	// re-asserts the status-change interrupt forever.
 	uint8_t chg = hub->ctrl_buf[2];
+	uint8_t feat;
+	uhd_callback_setup_end_t cb = on_other_change_cleared;
 
 	if (chg & 0x01) {
 		// Connection change: ack, then attach/detach in on_conn_change_cleared.
-		port_clear_feature(add, hub->cur_port, HUB_FEAT_PORT_CONNECTION_CHANGE,
-		                   on_conn_change_cleared);
-	} else if (chg & 0x02) {
-		port_clear_feature(add, hub->cur_port, HUB_FEAT_PORT_ENABLE_CHANGE,
-		                   on_other_change_cleared);
-	} else if (chg & 0x04) {
-		port_clear_feature(add, hub->cur_port, HUB_FEAT_PORT_SUSPEND_CHANGE,
-		                   on_other_change_cleared);
-	} else if (chg & 0x08) {
-		port_clear_feature(add, hub->cur_port, HUB_FEAT_PORT_OVER_CURRENT_CHANGE,
-		                   on_other_change_cleared);
-	} else if (chg & 0x10) {
-		port_clear_feature(add, hub->cur_port, HUB_FEAT_PORT_RESET_CHANGE,
-		                   on_other_change_cleared);
-	} else {
+		feat = HUB_FEAT_PORT_CONNECTION_CHANGE;
+		cb   = on_conn_change_cleared;
+	}
+	else if (chg & 0x02) feat = HUB_FEAT_PORT_ENABLE_CHANGE;
+	else if (chg & 0x04) feat = HUB_FEAT_PORT_SUSPEND_CHANGE;
+	else if (chg & 0x08) feat = HUB_FEAT_PORT_OVER_CURRENT_CHANGE;
+	else if (chg & 0x10) feat = HUB_FEAT_PORT_RESET_CHANGE;
+	else {
 		// No change bits set for this port; just look for the next change.
 		hub_start_status_poll(hub);
+		return;
+	}
+	if (!port_clear_feature(add, hub->cur_port, feat, cb)) {
+		// change stays latched; the retried poll will re-report it
+		hub_sof_schedule(hub, HUB_SOF_START_POLL, 2);
 	}
 }
 
@@ -378,7 +508,13 @@ static void on_other_change_cleared(usb_add_t add, uhd_trans_status_t status,
 static void on_conn_change_cleared(usb_add_t add, uhd_trans_status_t status,
                                    uint16_t n) {
 	uhi_hub_t* hub = get_hub_by_addr(add);
-	if (hub == NULL || status != UHD_TRANS_NOERROR) return;
+	if (hub == NULL) return;
+	if (status != UHD_TRANS_NOERROR) {
+		// Transient transfer error: keep the hub serviced. If the clear did
+		// not take, the latched change will simply be reported again.
+		hub_start_status_poll(hub);
+		return;
+	}
 
 	bool connected = hub->ctrl_buf[0] & 0x01; // current status.connection
 	uint8_t port_bit = (hub->cur_port >= 1 && hub->cur_port <= UHI_HUB_MAX_PORTS)
@@ -427,6 +563,16 @@ static void on_conn_change_cleared(usb_add_t add, uhd_trans_status_t status,
 //   CLEAR_FEATURE(C_PORT_RESET) -> callback(). The GET_STATUS polling is
 //   self-clocking: each control transfer takes ~1ms and a hub completes reset in
 //   ~10-20ms, so a handful of polls covers it without an explicit timer.
+// Reset handshake over (success is handled by on_reset_cleared; this is the
+// failure path): clear the handshake state, then let enumeration proceed to
+// fail cleanly via the stashed callback.
+static void hub_reset_fail(uhi_hub_t* hub) {
+	uhd_callback_reset_t cb = hub->reset_cb;
+	hub->reset_cb = NULL;
+	hub->state    = HUB_ST_IDLE;
+	if (cb) cb();
+}
+
 void uhi_hub_send_reset(uhc_device_t* dev, uhd_callback_reset_t callback) {
 	uhi_hub_t* hub = get_hub_by_dev(dev->hub);
 	if (hub == NULL) { if (callback) callback(); return; }
@@ -435,8 +581,10 @@ void uhi_hub_send_reset(uhc_device_t* dev, uhd_callback_reset_t callback) {
 	hub->reset_port  = dev->hub_port;
 	hub->reset_polls = 0;
 	hub->state       = HUB_ST_RESETTING;
-	port_set_feature(hub->dev->address, hub->reset_port, HUB_FEAT_PORT_RESET,
-	                 on_reset_feature_set);
+	if (!port_set_feature(hub->dev->address, hub->reset_port,
+	                      HUB_FEAT_PORT_RESET, on_reset_feature_set)) {
+		hub_reset_fail(hub);
+	}
 }
 
 // PORT_RESET asserted -> start polling for reset completion.
@@ -444,15 +592,17 @@ static void on_reset_feature_set(usb_add_t add, uhd_trans_status_t status,
                                  uint16_t n) {
 	uhi_hub_t* hub = get_hub_by_addr(add);
 	if (hub == NULL) return;
-	if (status != UHD_TRANS_NOERROR) { if (hub->reset_cb) hub->reset_cb(); return; }
-	port_get_status(hub, hub->reset_port, on_reset_poll);
+	if (status != UHD_TRANS_NOERROR ||
+	    !port_get_status(hub, hub->reset_port, on_reset_poll)) {
+		hub_reset_fail(hub);
+	}
 }
 
 // GET_STATUS(port) during reset -> done when change.reset (bit 4) is set.
 static void on_reset_poll(usb_add_t add, uhd_trans_status_t status, uint16_t n) {
 	uhi_hub_t* hub = get_hub_by_addr(add);
 	if (hub == NULL) return;
-	if (status != UHD_TRANS_NOERROR) { if (hub->reset_cb) hub->reset_cb(); return; }
+	if (status != UHD_TRANS_NOERROR) { hub_reset_fail(hub); return; }
 
 	// port status response: change word is bytes [2..3]; reset = bit 4 -> 0x10.
 	if (hub->ctrl_buf[2] & 0x10) {
@@ -466,16 +616,21 @@ static void on_reset_poll(usb_add_t add, uhd_trans_status_t status, uint16_t n) 
 		else if (pstat & (1u << 10)) hub_reset_speed = UHD_SPEED_HIGH;
 		else                         hub_reset_speed = UHD_SPEED_FULL;
 		// Ack the change, then resume enum.
-		port_clear_feature(hub->dev->address, hub->reset_port,
-		                   HUB_FEAT_PORT_RESET_CHANGE, on_reset_cleared);
+		if (!port_clear_feature(hub->dev->address, hub->reset_port,
+		                        HUB_FEAT_PORT_RESET_CHANGE, on_reset_cleared)) {
+			hub_reset_fail(hub);
+		}
 	} else if (++hub->reset_polls < 50) {
-		port_get_status(hub, hub->reset_port, on_reset_poll); // not done; poll again
+		// not done; poll again
+		if (!port_get_status(hub, hub->reset_port, on_reset_poll)) {
+			hub_reset_fail(hub);
+		}
 	} else {
 		// Timed out waiting for reset; resume so enumeration fails cleanly.
 #ifdef USB_TOPO_DEBUG
 		usb_dbg_log_val("rstTO p", hub->reset_port);
 #endif
-		if (hub->reset_cb) hub->reset_cb();
+		hub_reset_fail(hub);
 	}
 }
 
@@ -503,8 +658,8 @@ void uhi_hub_suspend(uhc_device_t* dev) {
 void uhi_hub_uninstall(uhc_device_t* dev) {
 	uhi_hub_t* hub = get_hub_by_dev(dev);
 	if (hub == NULL) return;
-	// TODO: tear down any still-attached downstream devices on this hub first
-	// (uhc_hub_port_change(hub, port, false)) to avoid orphaned devices.
+	// Downstream devices are torn down by uhc_connection_tree's root-unplug
+	// sweep in uhc.c before this runs; the slot only needs clearing here.
 	memset(hub, 0, sizeof(*hub)); // frees the slot (dev = NULL)
 }
 
@@ -516,6 +671,41 @@ void uhi_hub_poll_resume(uhc_device_t* hub_dev) {
 	uhi_hub_t* hub = get_hub_by_dev(hub_dev);
 	if (hub != NULL) {
 		hub_start_status_poll(hub);
+	}
+}
+
+// Set while any device enumeration is in flight (src/usb.c). Deferred poll
+// arms must not race the enumeration's control traffic on shared pipe 0.
+extern volatile uint8_t usb_enumeration_active;
+
+// 1 ms SOF tick (UHI sof_notify hook): runs the deferred actions scheduled
+// by hub_sof_schedule() — the bPwrOn2PwrGood settle time, status-poll re-arm
+// retries, and bounded enable-sequence retries.
+void uhi_hub_sof(bool b_micro) {
+	if (b_micro) return;
+	for (uint8_t i = 0; i < UHI_HUB_MAX; i++) {
+		uhi_hub_t* hub = &hubs[i];
+		if (hub->dev == NULL || hub->sof_delay == 0) continue;
+		if (--hub->sof_delay != 0) continue;
+
+		uint8_t action = hub->sof_action;
+		hub->sof_action = HUB_SOF_NONE;
+		switch (action) {
+		case HUB_SOF_START_POLL:
+			if (usb_enumeration_active) {
+				// pipe 0 is busy enumerating a device; hold the re-arm
+				// (uhi_hub_poll_resume also fires when the enum finishes)
+				hub_sof_schedule(hub, HUB_SOF_START_POLL, 2);
+				break;
+			}
+			hub_start_status_poll(hub);
+			break;
+		case HUB_SOF_RETRY_ENABLE:
+			hub_enable_start(hub);
+			break;
+		default:
+			break;
+		}
 	}
 }
 

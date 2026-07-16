@@ -17,13 +17,16 @@
 #include "uhd.h"
 
 // Max simultaneous hubs and max downstream ports we will service. Keep small —
-// the AVR32 USBB has only ~7 pipes total (one shared control pipe). One hub
-// with a few ports is the realistic target. See plan "Hardware ceiling".
+// the AVR32 USBB has only ~7 pipes total (one shared control pipe), so the
+// pipe budget (not the port count) is what limits usable devices.
+// UHI_HUB_MAX_PORTS is capped at 7 by design: the status-change poll reads a
+// 1-byte bitmap (bit 0 = hub, bits 1..7 = ports). ALL reported ports are
+// powered, but on a >7-port hub, changes on ports 8+ are never seen.
 #ifndef UHI_HUB_MAX
 #  define UHI_HUB_MAX 1
 #endif
 #ifndef UHI_HUB_MAX_PORTS
-#  define UHI_HUB_MAX_PORTS 4
+#  define UHI_HUB_MAX_PORTS 7
 #endif
 
 // USB hub class code (bInterfaceClass). Mirrors TUSB_CLASS_HUB.
@@ -34,6 +37,13 @@
 #define HUB_REQ_CLEAR_FEATURE  1
 #define HUB_REQ_SET_FEATURE    3
 #define HUB_REQ_GET_DESCRIPTOR 6
+
+// Hub class descriptor type (USB 2.0 11.23.2.1); GET_DESCRIPTOR wValue high byte
+#define HUB_DT_HUB 0x29
+
+// Hub-level features (USB 2.0 table 11-17) — CLEAR_FEATURE to the DEVICE
+#define HUB_FEAT_C_HUB_LOCAL_POWER  0
+#define HUB_FEAT_C_HUB_OVER_CURRENT 1
 
 // Port features (hub.h: HUB_FEATURE_PORT_*)
 #define HUB_FEAT_PORT_RESET             4
@@ -48,6 +58,7 @@
 // bmRequestType values (recipient/type/dir) for hub vs port requests.
 //   D7 dir (1=IN), D6..5 type (01=class), D4..0 recipient (0=device,3=other)
 #define HUB_REQTYPE_DEV_IN   0xA0
+#define HUB_REQTYPE_DEV_OUT  0x20
 #define HUB_REQTYPE_PORT_IN  0xA3
 #define HUB_REQTYPE_PORT_OUT 0x23
 
@@ -56,12 +67,16 @@
 	.install    = uhi_hub_install, \
 	.enable     = uhi_hub_enable, \
 	.uninstall  = uhi_hub_uninstall, \
-	.sof_notify = NULL, \
+	.sof_notify = uhi_hub_sof, \
 }
 
 extern uhc_enum_status_t uhi_hub_install(uhc_device_t* dev);
 extern void uhi_hub_enable(uhc_device_t* dev);
 extern void uhi_hub_uninstall(uhc_device_t* dev);
+
+// 1 ms SOF tick: drives the hub's deferred actions (bPwrOn2PwrGood settle
+// time, status-poll re-arm retries, enable-sequence retries).
+extern void uhi_hub_sof(bool b_micro);
 
 // Called by uhc.c during enumeration of a device that sits BEHIND a hub
 // (uhc.c references these inside #ifdef USB_HOST_HUB_SUPPORT, ~lines 229/249).
