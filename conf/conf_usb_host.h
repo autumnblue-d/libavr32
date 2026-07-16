@@ -11,10 +11,12 @@
 /// don't sleep
 #define UHD_NO_SLEEP_MGR
 
-// USB hub support. Enables the grid + keyboard (+ MIDI) through a powered hub.
-// See USB_HUB_PORT_PLAN.md. Comment out to build the original single-device
-// firmware.
-#define USB_HOST_HUB_SUPPORT
+// USB hub support (grid + keyboard + MIDI through a powered hub, see
+// USB_HUB_PORT_PLAN.md) is an APPLICATION opt-in: the consuming build must
+// define USB_HOST_HUB_SUPPORT (CPPFLAGS += -D USB_HOST_HUB_SUPPORT) AND
+// compile src/usb/hub/uhi_hub.c with src/usb/hub on the include path.
+// Builds without it (e.g. vanilla teletype) get the original single-device
+// stack from this same libavr32 branch.
 
 //! Array of UHI APIs Define the list of UHI supported by USB host.
 // #define USB_HOST_UHI        UHI_FTDI , UHI_HID
@@ -84,7 +86,9 @@
 #define UHI_MSC_CHANGE(dev,b_plug) msc_change(dev, b_plug)
 
 
-#include "uhi_hub.h"
+#ifdef USB_HOST_HUB_SUPPORT
+#include "uhi_hub.h" // consumer must have src/usb/hub on its include path
+#endif
 #include "uhi_ftdi.h"
 #include "uhi_hid.h"
 #include "uhi_midi.h"
