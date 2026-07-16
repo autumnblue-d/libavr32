@@ -276,6 +276,35 @@ static void uhc_connection_tree(bool b_plug, uhc_device_t* dev)
 		UHC_CONNECTION_EVENT(uhc_dev_enum, true);
 		uhc_enumeration_step1();
 	} else {
+#ifdef USB_HOST_HUB_SUPPORT
+		// When the dock/hub on the ROOT port is unplugged, tear down all of its
+		// downstream devices too, or they're orphaned in the device list
+		// (dangling ->hub, still holding USB addresses/pipes) and the next dock
+		// can't enumerate -> "power cycle needed to switch docks".
+		//
+		// Guard on the root device ONLY. A downstream device that merely bounces
+		// while another device is still enumerating also disconnects through here
+		// (via uhc_hub_port_change -> uhc_connection_tree(false, d), d != root);
+		// running the recursive sweep then frees a device mid-enumeration and
+		// corrupts it (this broke 3-device enumeration on a cascaded hub). The
+		// root device disconnects only when the whole dock is physically removed
+		// -- an idle moment where sweeping its children is safe. (One hub tier is
+		// serviced today, so the root's direct children cover the whole tree.)
+		if (&g_uhc_device_root == dev) {
+			bool removed_child;
+			do {
+				removed_child = false;
+				for (uhc_device_t *c = g_uhc_device_root.next; c != NULL;
+				     c = c->next) {
+					if (c->hub == dev) {
+						uhc_connection_tree(false, c);
+						removed_child = true;
+						break; // list changed; rescan from the top
+					}
+				}
+			} while (removed_child);
+		}
+#endif
 		if (uhc_dev_enum == dev) {
 			// Eventually stop enumeration timeout on-going on this device
 			uhc_sof_timeout = 0;
