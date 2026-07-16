@@ -57,8 +57,9 @@ typedef struct {
 
 	// Ports holding a device we already rejected as unsupported (low-speed behind
 	// a full-speed hub). Bit (port-1). Cleared when that port reports disconnect.
-	// Stops the reset->reject->reset loop that would otherwise re-malloc a
-	// uhc_device_t every round (uhc_hub_port_change does not dedupe on connect).
+	// Stops the reset->reject->reset loop: uhc_hub_port_change's duplicate-connect
+	// guard tears down the stale device and re-enumerates, so without this bit a
+	// rejected device would be re-enumerated (and re-rejected) every round.
 	uint8_t rejected;
 
 	// Word-aligned for USBB DMA (matches COMPILER_WORD_ALIGNED in the other UHI

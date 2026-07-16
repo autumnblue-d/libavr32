@@ -357,6 +357,19 @@ static void uhc_connection_tree(bool b_plug, uhc_device_t* dev)
 void uhc_hub_port_change(uhc_device_t *hub, uint8_t hub_port, bool b_plug)
 {
 	if (b_plug) {
+		// Duplicate-connect guard: a connector bounce can latch ONE
+		// C_PORT_CONNECTION change while port status already shows connected
+		// again, so a connect report can arrive while a device is still tracked
+		// on this (hub, port). The bounce means that device rebooted -- its
+		// address/pipes/UHI state are stale -- so tear it down first, then
+		// enumerate the new arrival. Without this, the old uhc_device_t is
+		// orphaned still holding its pipes and USB address.
+		for (uhc_device_t *d = g_uhc_device_root.next; d != NULL; d = d->next) {
+			if (d->hub == hub && d->hub_port == hub_port) {
+				uhc_connection_tree(false, d);
+				break;
+			}
+		}
 		uhc_device_t *nd = malloc(sizeof(uhc_device_t));
 		if (nd == NULL) {
 			Assert(false);
