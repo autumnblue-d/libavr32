@@ -1954,10 +1954,15 @@ void uhd_dbg_dump_pipes(void)
 static void uhd_pipe_finish_job(uint8_t pipe, uhd_trans_status_t status)
 {
 	uhd_pipe_job_t *ptr_job;
+	irqflags_t flags;
 
-	// Job over (completion or abort): disarm the NAK throttle for this pipe
+	// Job over (completion or abort): disarm the NAK throttle for this pipe.
+	// The bitmap clear is a read-modify-write racing the |= in the pipe ISR;
+	// finish_job is reachable from thread context via uhd_ep_abort, so mask.
+	flags = cpu_irq_save();
 	uhd_disable_nak_received_interrupt(pipe);
 	uhd_pipes_nak_frozen &= (uint8_t)~(1 << pipe);
+	cpu_irq_restore(flags);
 
 	// Get job corresponding at endpoint
 	ptr_job = &uhd_pipe_job[pipe - 1];

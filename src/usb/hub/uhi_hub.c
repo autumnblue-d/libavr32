@@ -130,6 +130,9 @@ static uhi_hub_t* get_hub_by_addr(usb_add_t add) {
 	return NULL;
 }
 
+// CAUTION: get_hub_by_dev(NULL) returns a FREE slot — uhi_hub_install relies
+// on this to allocate. Never call it with a possibly-NULL device pointer
+// expecting a "not found" result.
 static uhi_hub_t* get_hub_by_dev(uhc_device_t* dev) {
 	for (uint8_t i = 0; i < UHI_HUB_MAX; i++) {
 		if (hubs[i].dev == dev) return &hubs[i];
@@ -193,6 +196,10 @@ static void on_hub_status(usb_add_t add, uhd_trans_status_t status, uint16_t n);
 static void on_hub_oc_cleared(usb_add_t add, uhd_trans_status_t status, uint16_t n);
 static void hub_enable_start(uhi_hub_t* hub);
 static void hub_enable_retry(uhi_hub_t* hub);
+
+//--------------------------------------------------------------------+
+// SOF deferred-action scheduling (executed by uhi_hub_sof, bottom of file)
+//--------------------------------------------------------------------+
 
 // Schedule `action` to run `ms` milliseconds from now (from uhi_hub_sof).
 // One slot per hub: a later schedule replaces an earlier pending one.
@@ -287,7 +294,13 @@ static void on_hubdesc(usb_add_t add, uhd_trans_status_t status, uint16_t n) {
 		return;
 	}
 
-	// hub_desc_cs_t layout: [2]=bNbrPorts, [5]=bPwrOn2PwrGood
+	// hub_desc_cs_t layout: [1]=bDescriptorType, [2]=bNbrPorts,
+	// [5]=bPwrOn2PwrGood. A wrong type or zero ports means the hub answered
+	// with garbage — retry rather than driving a nonsensical port walk.
+	if (hub->ctrl_buf[1] != HUB_DT_HUB || hub->ctrl_buf[2] == 0) {
+		hub_enable_retry(hub);
+		return;
+	}
 	hub->pwr_good_2ms = hub->ctrl_buf[5];
 	hub->pwr_ports    = hub->ctrl_buf[2]; // power ALL reported ports...
 	hub->nb_ports     = hub->pwr_ports;   // ...but watch at most 7 (bitmap)
@@ -376,8 +389,10 @@ static void on_status_change(usb_add_t add, usb_ep_t ep,
 	}
 
 	uint8_t change = hub->status_change[0];
-	if (change == 0) {
-		hub_start_status_poll(hub); // spurious; re-arm (TinyUSB processed=false)
+	if (n == 0 || change == 0) {
+		// n == 0: zero-length completion, status_change[0] is stale — do not
+		// reprocess old bits. change == 0: spurious (TinyUSB processed=false).
+		hub_start_status_poll(hub);
 		return;
 	}
 
@@ -425,21 +440,21 @@ static void on_hub_status(usb_add_t add, uhd_trans_status_t status, uint16_t n) 
 		              on_hub_oc_cleared)) {
 			hub_sof_schedule(hub, HUB_SOF_START_POLL, 2);
 		}
-	}
-	else if (chg & 0x01) {
+	} else if (chg & 0x01) {
 		if (!hub_ctrl(add, HUB_REQTYPE_DEV_OUT, HUB_REQ_CLEAR_FEATURE,
 		              HUB_FEAT_C_HUB_LOCAL_POWER, 0, NULL, 0,
 		              on_other_change_cleared)) {
 			hub_sof_schedule(hub, HUB_SOF_START_POLL, 2);
 		}
-	}
-	else {
+	} else {
 		// No hub change bit set (spurious); just resume watching.
 		hub_start_status_poll(hub);
 	}
 }
 
 // C_HUB_OVER_CURRENT acked -> ports lost power; run the power walk again.
+// `status` is deliberately ignored: re-powering is harmless if the ack
+// failed, and a still-latched change simply gets reported again.
 static void on_hub_oc_cleared(usb_add_t add, uhd_trans_status_t status,
                               uint16_t n) {
 	uhi_hub_t* hub = get_hub_by_addr(add);
@@ -477,12 +492,15 @@ static void on_port_status(usb_add_t add, uhd_trans_status_t status, uint16_t n)
 		// Connection change: ack, then attach/detach in on_conn_change_cleared.
 		feat = HUB_FEAT_PORT_CONNECTION_CHANGE;
 		cb   = on_conn_change_cleared;
-	}
-	else if (chg & 0x02) feat = HUB_FEAT_PORT_ENABLE_CHANGE;
-	else if (chg & 0x04) feat = HUB_FEAT_PORT_SUSPEND_CHANGE;
-	else if (chg & 0x08) feat = HUB_FEAT_PORT_OVER_CURRENT_CHANGE;
-	else if (chg & 0x10) feat = HUB_FEAT_PORT_RESET_CHANGE;
-	else {
+	} else if (chg & 0x02) {
+		feat = HUB_FEAT_PORT_ENABLE_CHANGE;
+	} else if (chg & 0x04) {
+		feat = HUB_FEAT_PORT_SUSPEND_CHANGE;
+	} else if (chg & 0x08) {
+		feat = HUB_FEAT_PORT_OVER_CURRENT_CHANGE;
+	} else if (chg & 0x10) {
+		feat = HUB_FEAT_PORT_RESET_CHANGE;
+	} else {
 		// No change bits set for this port; just look for the next change.
 		hub_start_status_poll(hub);
 		return;
@@ -555,17 +573,9 @@ static void on_conn_change_cleared(usb_add_t add, uhd_trans_status_t status,
 // Called BY uhc.c while enumerating a device behind this hub (uhc.c ~229/249)
 //--------------------------------------------------------------------+
 
-// Reset the hub port `dev` is attached to, then signal completion.
-// (TinyUSB hub_port_reset = SET_FEATURE(PORT_RESET); hub.h:184)
-//
-// UHC's enumeration cannot proceed until `callback` fires:
-//   SET_FEATURE(PORT_RESET) -> poll GET_STATUS(port) until C_PORT_RESET ->
-//   CLEAR_FEATURE(C_PORT_RESET) -> callback(). The GET_STATUS polling is
-//   self-clocking: each control transfer takes ~1ms and a hub completes reset in
-//   ~10-20ms, so a handful of polls covers it without an explicit timer.
-// Reset handshake over (success is handled by on_reset_cleared; this is the
-// failure path): clear the handshake state, then let enumeration proceed to
-// fail cleanly via the stashed callback.
+// Reset handshake failed (success is handled by on_reset_cleared): clear the
+// handshake state, then let enumeration proceed to fail cleanly via the
+// stashed callback.
 static void hub_reset_fail(uhi_hub_t* hub) {
 	uhd_callback_reset_t cb = hub->reset_cb;
 	hub->reset_cb = NULL;
@@ -573,6 +583,15 @@ static void hub_reset_fail(uhi_hub_t* hub) {
 	if (cb) cb();
 }
 
+// Reset the hub port `dev` is attached to, then signal completion.
+// (TinyUSB hub_port_reset = SET_FEATURE(PORT_RESET); hub.h:184)
+//
+// UHC's enumeration cannot proceed until `callback` fires:
+//   SET_FEATURE(PORT_RESET) -> poll GET_STATUS(port) until C_PORT_RESET ->
+//   CLEAR_FEATURE(C_PORT_RESET) -> callback(). The GET_STATUS poll count is
+//   bounded (50); a hub completes reset in ~10-20ms and each poll costs at
+//   least one control-transfer round-trip. TRSTRCY recovery after the reset
+//   is provided by uhc.c's SOF timeouts (steps 2/4), not here.
 void uhi_hub_send_reset(uhc_device_t* dev, uhd_callback_reset_t callback) {
 	uhi_hub_t* hub = get_hub_by_dev(dev->hub);
 	if (hub == NULL) { if (callback) callback(); return; }
