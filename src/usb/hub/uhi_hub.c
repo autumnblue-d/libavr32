@@ -25,6 +25,10 @@
 #include "conf_usb_host.h"
 #include "uhi_hub.h"
 
+#ifdef USB_TOPO_DEBUG
+#include "usb_dbg.h"
+#endif
+
 // Inert unless USB_HOST_HUB_SUPPORT is defined: the body references uhc_device_t
 // fields (->hub, ->hub_port) that only exist under that flag, so the file can
 // live in the build (config.mk) without breaking a hub-disabled compile.
@@ -260,8 +264,18 @@ static void on_port_power(usb_add_t add, uhd_trans_status_t status, uint16_t n) 
 //--------------------------------------------------------------------+
 static void hub_start_status_poll(uhi_hub_t* hub) {
 	// interrupt IN, 1 byte enough for <=7 ports (bit0 hub + bits 1..n ports)
+#ifdef USB_TOPO_DEBUG
+	// "poll!" once per failure streak: the status poll could not be re-armed
+	// (uhd request slots exhausted / pipe gone) — hub servicing is now dead.
+	static bool poll_run_failed;
+	bool ok = uhd_ep_run(hub->dev->address, hub->ep_in, true,
+	                     hub->status_change, 1, 0, on_status_change);
+	if (!ok && !poll_run_failed) usb_dbg_push("poll!");
+	poll_run_failed = !ok;
+#else
 	uhd_ep_run(hub->dev->address, hub->ep_in, true,
 	           hub->status_change, 1, 0, on_status_change);
+#endif
 }
 
 // interrupt transfer completed -> decode which port changed (hub_xfer_cb)
@@ -271,6 +285,22 @@ static void on_status_change(usb_add_t add, usb_ep_t ep,
 	uhi_hub_t* hub = get_hub_by_addr(add);
 	if (hub == NULL) return;
 
+#ifdef USB_TOPO_DEBUG
+	// Log only the FIRST error of a streak — if the error completes
+	// synchronously, the re-arm below loops at IRQ rate and per-error pushes
+	// would flood the ring. "sc t <status>" then silence + frozen module =
+	// tight error/re-arm loop with that status. On recovery, "sc ok <count>"
+	// reports how many errors the streak had.
+	static uint16_t sc_err_streak;
+	if (status != UHD_TRANS_NOERROR) {
+		if (sc_err_streak == 0) usb_dbg_log_val("sc t", status);
+		if (sc_err_streak < 0xFFFF) sc_err_streak++;
+	}
+	else if (sc_err_streak != 0) {
+		usb_dbg_log_val("sc ok", sc_err_streak);
+		sc_err_streak = 0;
+	}
+#endif
 	if (status != UHD_TRANS_NOERROR) {
 		hub_start_status_poll(hub); // re-arm and bail
 		return;
@@ -442,6 +472,9 @@ static void on_reset_poll(usb_add_t add, uhd_trans_status_t status, uint16_t n) 
 		port_get_status(hub, hub->reset_port, on_reset_poll); // not done; poll again
 	} else {
 		// Timed out waiting for reset; resume so enumeration fails cleanly.
+#ifdef USB_TOPO_DEBUG
+		usb_dbg_log_val("rstTO p", hub->reset_port);
+#endif
 		if (hub->reset_cb) hub->reset_cb();
 	}
 }

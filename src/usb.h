@@ -14,6 +14,13 @@ void usb_vbus_change(bool b_vbus_present);
 void usb_vbus_error(void);
 
 // usb connection callback
+// Nonzero while a USB device enumeration is in progress (set at the connect
+// report, cleared by usb_enum). Bulk traffic to already-connected devices does
+// not reliably survive a concurrent enumeration on this host (a pending grid
+// bulk-IN during a heavy composite enumeration kills the grid's init), so the
+// module keeps monome traffic off the bus while this is set.
+extern volatile uint8_t usb_enumeration_active;
+
 void usb_connection(uhc_device_t *dev, bool b_present);
 
 // usb wakeup callback

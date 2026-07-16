@@ -98,5 +98,19 @@ u8 event_post( event_t *e ) {
   //if (!status)
   //  print_dbg("\r\n event queue full!");
 
+#ifdef USB_TOPO_DEBUG
+  {
+    // Event dropped on full queue — silent data loss (a dropped MonomeRefresh
+    // or MonomeConnect looks exactly like a dead grid). First of each streak.
+    extern void usb_dbg_push(const char* s); // avoid header dependency here
+    static u8 evq_full;
+    if (!status) {
+      if (!evq_full) usb_dbg_push("evQ!");
+      evq_full = 1;
+    }
+    else evq_full = 0;
+  }
+#endif
+
   return status;
 }

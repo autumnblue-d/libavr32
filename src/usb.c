@@ -5,6 +5,10 @@
 #include "conf_usb_host.h" // USB_HOST_HUB_SUPPORT + hub-aware uhc_device_t layout
 #include "usb.h"
 
+#ifdef USB_TOPO_DEBUG
+#include "usb_dbg.h"
+#endif
+
 /*
 ///// TODO! 
 most of these things don't really need to be implemented
@@ -32,12 +36,13 @@ void usb_vbus_error(void) {
 
 }
 
+volatile uint8_t usb_enumeration_active;
+
 // usb connection callback
 void usb_connection(uhc_device_t *dev, bool b_present) {
-    // print_dbg("\r\n usb device connection: ");
-    // print_dbg_hex(dev);
-    // print_dbg(" , ");
-    // print_dbg_ulong(b_present);
+    // Enumeration of this device starts now (uhc_connection_tree). The flag
+    // clears in usb_enum() when enumeration finishes (success or give-up).
+    if (b_present) usb_enumeration_active = 1;
 }
 
 // usb wakeup callback
@@ -52,6 +57,11 @@ void usb_sof(void) {
 
 // usb end-of-enumeration callback
 void usb_enum(uhc_device_t *dev, uhc_enum_status_t status) {
+  usb_enumeration_active = 0;
+#ifdef USB_TOPO_DEBUG
+  // "E <addr> <status>" — status: 0 = UHC_ENUM_SUCCESS, see uhc_enum_status_t
+  usb_dbg_log2("E", dev->address, status);
+#endif
 #ifdef USB_HOST_HUB_SUPPORT
   // A device behind a hub just finished enumerating (success or final failure).
   // pipe 0 is free again -> resume that hub's status poll so the NEXT device

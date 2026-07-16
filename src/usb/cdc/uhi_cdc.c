@@ -10,6 +10,10 @@
 #include "cdc.h"
 #include "uhi_cdc.h"
 
+#ifdef USB_TOPO_DEBUG
+#include "usb_dbg.h"
+#endif
+
 //------ DEFINES
 /*
 #define UHI_FTDI_TIMEOUT 20
@@ -61,6 +65,10 @@ uhc_enum_status_t uhi_cdc_install(uhc_device_t* dev) {
   // print_dbg("\r\n run uhi_ftdi_install");
 
   if (uhi_cdc_dev.dev != NULL) {
+#ifdef USB_TOPO_DEBUG
+    // MCDC slot already held by another device; this dev is turned away.
+    usb_dbg_log_val("cdcB a", dev->address);
+#endif
     return UHC_ENUM_SOFTWARE_LIMIT; // Device already allocated
   }
 
@@ -125,6 +133,10 @@ uhc_enum_status_t uhi_cdc_install(uhc_device_t* dev) {
 
   if (b_iface_supported) {
     uhi_cdc_dev.dev = dev;
+#ifdef USB_TOPO_DEBUG
+    // MCDC claimed this device (matched a CDC-data-class interface).
+    usb_dbg_log_val("cdcC a", dev->address);
+#endif
     //print_dbg("\r\n completed device install");
     return UHC_ENUM_SUCCESS;
   }
@@ -137,6 +149,9 @@ void uhi_cdc_enable(uhc_device_t* dev) {
     return;  // No interface to enable
   }
 
+#ifdef USB_TOPO_DEBUG
+  usb_dbg_push("cdc m"); // MCDC claimed this dev; about to cdc_change
+#endif
   cdc_change(dev, true);
 }
 
@@ -144,6 +159,10 @@ void uhi_cdc_uninstall(uhc_device_t* dev) {
   if (uhi_cdc_dev.dev != dev) {
     return; // Device not enabled in this interface
   }
+#ifdef USB_TOPO_DEBUG
+  // MCDC slot released (device torn down) — the slot is open again.
+  usb_dbg_log_val("cdcU a", dev->address);
+#endif
   uhi_cdc_dev.dev = NULL;
   Assert(uhi_cdc_dev.report!=NULL);
   cdc_change(dev, false);

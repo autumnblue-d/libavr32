@@ -52,6 +52,10 @@
 #include <stdlib.h>
 #include <string.h> // memset() in uhc_hub_port_change()
 
+#ifdef USB_TOPO_DEBUG
+#include "usb_dbg.h" // enumeration trace ring (rendered by the module's OLED)
+#endif
+
 #ifndef USB_HOST_UHI
 #  error USB_HOST_UHI must be defined with unless one UHI interface in conf_usb_host.h file.
 #endif
@@ -356,6 +360,9 @@ static void uhc_connection_tree(bool b_plug, uhc_device_t* dev)
  */
 void uhc_hub_port_change(uhc_device_t *hub, uint8_t hub_port, bool b_plug)
 {
+#ifdef USB_TOPO_DEBUG
+	usb_dbg_log_val(b_plug ? "P+" : "P-", hub_port);
+#endif
 	if (b_plug) {
 		// Duplicate-connect guard: a connector bounce can latch ONE
 		// C_PORT_CONNECTION change while port status already shows connected
@@ -808,6 +815,9 @@ static void uhc_enumeration_step14(
 		uhd_trans_status_t status,
 		uint16_t payload_trans)
 {
+#ifdef USB_TOPO_DEBUG
+	usb_dbg_log_step(14, status, payload_trans);
+#endif
 	usb_setup_req_t req;
 	bool b_conf_supported = false;
 	UNUSED(add);
@@ -889,6 +899,9 @@ static void uhc_enumeration_step15(
 		uhd_trans_status_t status,
 		uint16_t payload_trans)
 {
+#ifdef USB_TOPO_DEBUG
+	usb_dbg_log_step(15, status, payload_trans);
+#endif
 	UNUSED(add);
 	if ((status!=UHD_TRANS_NOERROR) || (payload_trans!=0)) {
 		for(uint8_t i = 0; i < UHC_NB_UHI; i++) {
@@ -1063,6 +1076,9 @@ static void uhc_enumeration_step18_lpm(
  */
 static void uhc_enumeration_error(uhc_enum_status_t status)
 {
+#ifdef USB_TOPO_DEBUG
+	usb_dbg_log2("ERR", status, uhc_enum_try);
+#endif
 	if (status == UHC_ENUM_DISCONNECT) {
 		uhc_enum_try = 0;
 		return; // Abort enumeration process

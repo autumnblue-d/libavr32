@@ -56,6 +56,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+#ifdef USB_TOPO_DEBUG
+#include "usb_dbg.h" // IRQ-storm detector (usb_dbg_irq_tick)
+#endif
+
 // Fix the fact that, for some IAR header files, the AVR32_USBB_IRQ_GROUP
 // define has been defined as AVR32_USB_IRQ_GROUP instead.
 #if !defined(AVR32_USBB_IRQ_GROUP)
@@ -338,6 +342,15 @@ typedef struct {
 
 //! Array to register a job on bulk/interrupt/isochronous endpoint
 static uhd_pipe_job_t uhd_pipe_job[AVR32_USBB_EPT_NUM - 1];
+
+//! Bulk pipes frozen after a NAK, to be retried (unfrozen) at the next SOF.
+//! The USBB retries a NAKed bulk pipe continuously (a NAK does not decrement
+//! UPINRQ and bulk pipes have no interval), so a device with nothing to send
+//! -- e.g. an idle MIDI-IN poll -- monopolizes the bus and starves other
+//! pipes' transfers (which then die by job timeout: grid dark whenever a MIDI
+//! device polls "above" it). Freeze-on-NAK + retry-per-SOF caps an idle pipe
+//! at one token per frame. See uhd_pipe_interrupt / uhd_sof_interrupt.
+static uint8_t uhd_pipes_nak_frozen;
 
 //! Variables to manage the suspend/resume sequence
 static uint8_t uhd_suspend_start;
@@ -1035,6 +1048,12 @@ static void uhd_interrupt(void)
 {
 	uint8_t pipe_int;
 
+#ifdef USB_TOPO_DEBUG
+	// Storm detector: UHINT names the pending interrupt (bit 8+p = pipe p,
+	// bit 5 = SOF), UHINTE the enabled mask. See usb_dbg.h.
+	usb_dbg_irq_tick(AVR32_USBB.uhint, AVR32_USBB.uhinte);
+#endif
+
 	// Manage SOF interrupt
 	if (Is_uhd_sof()) {
 		uhd_ack_sof();
@@ -1235,6 +1254,15 @@ static void uhd_sof_interrupt(void)
 			uhd_freeze_pipe(0);
 			uhd_ctrl_request_end(UHD_TRANS_TIMEOUT);
 		}
+	}
+	// Retry NAK-frozen bulk pipes: one token per frame per idle pipe
+	if (uhd_pipes_nak_frozen) {
+		for (uint8_t pipe = 1; pipe < AVR32_USBB_EPT_NUM; pipe++) {
+			if (uhd_pipes_nak_frozen & (uint8_t)(1 << pipe)) {
+				uhd_unfreeze_pipe(pipe);
+			}
+		}
+		uhd_pipes_nak_frozen = 0;
 	}
 	// Manage the timeouts on endpoint transfer
 	uhd_pipe_job_t *ptr_job;
@@ -1737,6 +1765,11 @@ static void uhd_pipe_trans_complet(uint8_t pipe)
 				uhd_in_request_number(pipe,
 						(next_trans+uhd_get_pipe_size(pipe)-1)/uhd_get_pipe_size(pipe));
 			}
+			if (USB_EP_TYPE_BULK == uhd_get_pipe_type(pipe)) {
+				// arm the NAK throttle (see uhd_pipes_nak_frozen)
+				uhd_ack_nak_received(pipe);
+				uhd_enable_nak_received_interrupt(pipe);
+			}
 			uhd_disable_bank_interrupt(pipe);
 			uhd_unfreeze_pipe(pipe);
 			uhd_pipe_dma_set_control(pipe, uhd_dma_ctrl);
@@ -1848,6 +1881,16 @@ static void uhd_pipe_interrupt(uint8_t pipe)
 		uhd_enable_bank_interrupt(pipe);
 		return;
 	}
+	if (Is_uhd_nak_received_interrupt_enabled(pipe) &&
+			Is_uhd_nak_received(pipe)) {
+		// Bulk NAK throttle: park the pipe until the next SOF instead of
+		// letting the hardware hammer the NAKing device non-stop and starve
+		// every other pipe's bus time (see uhd_pipes_nak_frozen).
+		uhd_ack_nak_received(pipe);
+		uhd_freeze_pipe(pipe);
+		uhd_pipes_nak_frozen |= (uint8_t)(1 << pipe);
+		return;
+	}
 	if (Is_uhd_stall(pipe)) {
 		uhd_ack_stall(pipe);
 		uhd_reset_data_toggle(pipe);
@@ -1884,6 +1927,23 @@ static void uhd_ep_abort_pipe(uint8_t pipe, uhd_trans_status_t status)
 	uhd_pipe_finish_job(pipe, status);
 }
 
+#ifdef USB_TOPO_DEBUG
+// Dump the live pipe table to the trace ring (one line per pipe 0..6):
+// "p<N> a<addr> e<ep> [E][F][C]" — target address, endpoint number,
+// Enabled / Frozen / Config-OK. Triggered from the module with ALT+F9.
+void uhd_dbg_dump_pipes(void)
+{
+	for (uint8_t p = 0; p < AVR32_USBB_EPT_NUM - 1; p++) {
+		usb_dbg_log_pipe(p,
+				uhd_get_configured_address(p),
+				uhd_get_pipe_endpoint_address(p),
+				(Is_uhd_pipe_enabled(p) ? 1 : 0) |
+				(Is_uhd_pipe_frozen(p) ? 2 : 0) |
+				(Is_uhd_pipe_configured(p) ? 4 : 0));
+	}
+}
+#endif
+
 /**
  * \internal
  * \brief Call the callback linked to the end of pipe transfer
@@ -1894,6 +1954,10 @@ static void uhd_ep_abort_pipe(uint8_t pipe, uhd_trans_status_t status)
 static void uhd_pipe_finish_job(uint8_t pipe, uhd_trans_status_t status)
 {
 	uhd_pipe_job_t *ptr_job;
+
+	// Job over (completion or abort): disarm the NAK throttle for this pipe
+	uhd_disable_nak_received_interrupt(pipe);
+	uhd_pipes_nak_frozen &= (uint8_t)~(1 << pipe);
 
 	// Get job corresponding at endpoint
 	ptr_job = &uhd_pipe_job[pipe - 1];
