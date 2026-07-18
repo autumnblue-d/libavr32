@@ -819,6 +819,11 @@ bool uhd_ep_alloc(usb_add_t add, usb_ep_desc_t * ep_desc)
 		// Digitone MIDI bulk = 512). The full-speed USBB cannot allocate an
 		// oversized pipe, so cap non-isochronous endpoints at the FS maximum.
 		uint16_t max_pkt = le16_to_cpu(ep_desc->wMaxPacketSize);
+#ifdef USB_TOPO_DEBUG
+		// "epA <bEndpointAddress> <declared wMaxPacketSize>" — shows whether
+		// the FS clamp below actually fires for this endpoint.
+		usb_dbg_log2("epA", ep_desc->bEndpointAddress, max_pkt);
+#endif
 		if (ep_type != USB_EP_TYPE_ISOCHRONOUS && max_pkt > 64) {
 			max_pkt = 64;
 		}
@@ -1765,11 +1770,13 @@ static void uhd_pipe_trans_complet(uint8_t pipe)
 				uhd_in_request_number(pipe,
 						(next_trans+uhd_get_pipe_size(pipe)-1)/uhd_get_pipe_size(pipe));
 			}
+#ifndef UHD_NO_BULK_NAK_THROTTLE
 			if (USB_EP_TYPE_BULK == uhd_get_pipe_type(pipe)) {
 				// arm the NAK throttle (see uhd_pipes_nak_frozen)
 				uhd_ack_nak_received(pipe);
 				uhd_enable_nak_received_interrupt(pipe);
 			}
+#endif
 			uhd_disable_bank_interrupt(pipe);
 			uhd_unfreeze_pipe(pipe);
 			uhd_pipe_dma_set_control(pipe, uhd_dma_ctrl);
