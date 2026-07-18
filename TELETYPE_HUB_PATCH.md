@@ -7,21 +7,31 @@ device starves another device's transfers). The accompanying patch,
 [`libavr32-teletype-hub.patch`](./libavr32-teletype-hub.patch), wires all of
 that into a **vanilla monome/teletype `main`**.
 
+## !! Flash layout change — back up your scenes first
+
+The patch shrinks the NVRAM region **200K → 199K** to make room for the hub
+driver (the 32 scenes need ~198.5K, so they still fit). The region's base
+address moves, which means **the first boot after flashing re-seeds ALL saved
+scenes**. Export them (`WRITE TO USB`) on your current firmware before
+flashing, and read them back afterwards.
+
 ## What the patch does (teletype side only)
 
-Everything else lives on this libavr32 branch; the patch touches two files:
+Everything else lives on this libavr32 branch; the patch touches three files:
 
 - **`module/config.mk`** — compiles `uhi_hub.c`, adds `../src/usb/hub` to the
-  include path, and defines `USB_HOST_HUB_SUPPORT`. The define is an
-  **application opt-in**: without it (and the other two lines) this same
-  libavr32 branch builds the original single-device firmware unchanged.
+  include path, defines `USB_HOST_HUB_SUPPORT`, and sets NVRAM to 199K (see
+  above). The define is an **application opt-in**: without these lines this
+  same libavr32 branch builds the original single-device firmware unchanged.
 - **`module/main.c`** — the three module-side USB behaviors that field
   debugging showed are needed alongside the driver:
   - **MSC media gate**: only enter the USB-disk dialog when a LUN reports
     ready media (`uhi_msc_mem_test_unit_ready`). An empty card reader —
     common in USB-C docks — otherwise enumerates as mass storage and hijacks
-    the UI until unplugged. Note: the check runs once at connect; a card
-    inserted later requires a replug.
+    the UI until unplugged. The gate polls through FAIL/BUSY answers (a fresh
+    drive walks unit-attention sense codes before reporting ready); only
+    "medium not present" is a definitive empty reader. Note: the check runs
+    once at connect; a card inserted later requires a replug.
   - **Monome poll gating**: no grid bulk traffic while any device is
     enumerating (`usb_enumeration_active`, set by `src/usb.c` on this
     branch). A pending grid IN does not reliably survive a concurrent heavy
@@ -30,6 +40,15 @@ Everything else lives on this libavr32 branch; the patch touches two files:
     of enumeration quiet, instead of immediately at serial-connect. Without
     this (and the NAK throttle), a grid on a lower hub port than a composite
     MIDI device (e.g. Elektron Analog Rytm) stays dark.
+- **`module/usb_disk_mode.c`** — `nav_reset()` at disk-mode entry. The FAT
+  sector cache descriptor is a zero-initialized global whose "empty" marker
+  is 0xFF, so untouched it claims "LUN 0, sector 0 already loaded" and the
+  first mount reads 512 stale zero bytes instead of the MBR
+  (`FS_ERR_NO_FORMAT` on a perfectly good stick). Stock firmware only
+  escaped this by accident: the first TUR on a fresh drive returned BUSY,
+  whose retry path calls `fat_cache_reset()` — and the media gate above
+  removes that accident by walking the LUN to GOOD before the FAT layer
+  runs.
 
 ## Prerequisite
 

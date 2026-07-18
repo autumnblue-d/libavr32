@@ -5,25 +5,29 @@
 # `usb-dock-fixes` branch (provides src/usb/hub/uhi_hub.{c,h}, the hub-aware
 # uhc.c, and the USBB bulk NAK throttle).
 #
+# !! FLASH LAYOUT CHANGE: the NVRAM region shrinks 200K -> 199K to make room
+# !! for the hub driver. Its base address moves, so the FIRST BOOT AFTER
+# !! FLASHING RE-SEEDS ALL SAVED SCENES. Back scenes up (WRITE TO USB) on
+# !! your current firmware before flashing this one.
+#
 # Apply from the teletype repo root:
 #   git apply --check libavr32/libavr32-teletype-hub.patch   # dry run
 #   git apply         libavr32/libavr32-teletype-hub.patch
 #
 # Contents (teletype side only — everything else lives on the branch):
-#   module/config.mk — compile uhi_hub.c, add src/usb/hub to the include
-#     path, define USB_HOST_HUB_SUPPORT (an application opt-in).
-#   module/main.c    — the three module-side USB behaviors:
-#     * MSC media gate: only enter the USB-disk dialog when a LUN reports
-#       ready media (an empty dock card reader otherwise hijacks the UI).
-#       FAIL/BUSY answers are polled through (a fresh drive walks unit
-#       attention before reporting ready); only "medium not present" is a
-#       definitive empty reader.
-#     * monome poll gating: no grid bulk traffic while a device enumerates;
-#     * deferred monome setup: run the grid setup dialogue only after 50 ms
-#       of enumeration quiet (grid-before-MIDI otherwise leaves a dark grid).
+#   module/config.mk      — compile uhi_hub.c, add src/usb/hub to the include
+#     path, define USB_HOST_HUB_SUPPORT (application opt-in), NVRAM 199K.
+#   module/main.c         — MSC media gate (polls TUR through FAIL/BUSY, only
+#     "medium not present" is a definitive empty reader), monome poll gating
+#     during enumeration, deferred monome setup (50 ms enumeration quiet).
+#   module/usb_disk_mode.c — nav_reset() at disk-mode entry: the FAT sector
+#     cache is a zero-initialized global whose "empty" marker is 0xFF, so
+#     without a reset the first mount reads 512 stale zero bytes instead of
+#     the MBR. Stock code only escaped this by accident via a TUR-BUSY retry
+#     path that the media gate removes.
 #
 diff --git a/module/config.mk b/module/config.mk
-index 49a9cac..411683a 100644
+index 49a9cac..6826f32 100644
 --- a/module/config.mk
 +++ b/module/config.mk
 @@ -141,6 +141,7 @@ CSRCS = \
@@ -42,7 +46,7 @@ index 49a9cac..411683a 100644
  	../src/usb/ftdi						\
  	../src/usb/hid						\
  	../src/usb/midi						\
-@@ -255,7 +257,7 @@ CFLAGS = -fshort-enums -fno-common
+@@ -255,11 +257,15 @@ CFLAGS = -fshort-enums -fno-common
  # The most relevant symbols to define for the preprocessor are:
  #   BOARD      Target board in use, see boards/board.h for a list.
  #   EXT_BOARD  Optional extension board in use, see boards/board.h for a list.
@@ -51,6 +55,15 @@ index 49a9cac..411683a 100644
  
  # Extra flags to use when linking
  # NVRAM size may need to change if additional data is to be stored in scenes.
+-LDFLAGS = -Wl,-e,_trampoline,--defsym=__flash_nvram_size__=200K
++# Hub patch: 199K (was 200K) — the 32 scenes need ~198.5K, and the freed
++# 1K of program flash is required by the hub driver. NOTE: this moves the
++# NVRAM base, so the first boot after flashing RE-SEEDS ALL SAVED SCENES.
++# Back scenes up (WRITE TO USB) on the previous firmware before flashing.
++LDFLAGS = -Wl,-e,_trampoline,--defsym=__flash_nvram_size__=199K
+ 
+ # Pre- and post-build commands
+ PREBUILD_CMD =
 diff --git a/module/main.c b/module/main.c
 index 898f585..9bae012 100644
 --- a/module/main.c
@@ -142,3 +155,24 @@ index 898f585..9bae012 100644
  }
  
  static void handler_FtdiDisconnect(s32 data) {
+diff --git a/module/usb_disk_mode.c b/module/usb_disk_mode.c
+index 55cfa38..c88d563 100644
+--- a/module/usb_disk_mode.c
++++ b/module/usb_disk_mode.c
+@@ -111,6 +111,16 @@ void tele_usb_disk() {
+     print_dbg("\r\nusb");
+     uint8_t lun_state = 0;
+ 
++    // Reset the FAT navigation state, INCLUDING the sector cache. The cache
++    // descriptor is a zero-initialized global whose empty marker is 0xFF, so
++    // untouched it claims "LUN 0, sector 0 already loaded" and mount reads
++    // 512 zero bytes instead of the MBR (FS_ERR_NO_FORMAT on a good stick).
++    // The stock code survived by accident: fat_check_device()'s first TUR on
++    // a fresh drive returned BUSY, whose retry path calls fat_cache_reset().
++    // The MSC media gate in handler_MscConnect walks the LUN to GOOD before
++    // the FAT layer ever runs, so that accidental reset no longer happens.
++    nav_reset();
++
+     for (uint8_t lun = 0; (lun < uhi_msc_mem_get_lun()) && (lun < 8); lun++) {
+         // print_dbg("\r\nlun: ");
+         // print_dbg_ulong(lun);
