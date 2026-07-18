@@ -419,6 +419,21 @@ extern void uhc_notify_resume_lpm(void);
 
 //@}
 
+/**
+ * \brief Enable or disable the bulk NAK throttle at runtime.
+ *
+ * The throttle (freeze a NAKed bulk pipe until the next SOF) stops an idle
+ * grid/MIDI IN poll from starving the bus, but it also caps active bulk
+ * transfers -- USB mass storage -- to one token per frame. Disable it around
+ * an exclusive MSC disk operation to restore full-speed scene read/write,
+ * then re-enable it. Enabled by default. (No effect if the throttle was
+ * compiled out with UHD_NO_BULK_NAK_THROTTLE.)
+ *
+ * \param enabled  true to arm the throttle on new bulk transfers, false to
+ *                 leave bulk pipes on the hardware's continuous auto-retry.
+ */
+extern void uhd_bulk_nak_throttle_set(bool enabled);
+
 //@}
 
 #ifdef __cplusplus

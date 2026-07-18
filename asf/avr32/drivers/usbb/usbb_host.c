@@ -352,6 +352,18 @@ static uhd_pipe_job_t uhd_pipe_job[AVR32_USBB_EPT_NUM - 1];
 //! at one token per frame. See uhd_pipe_interrupt / uhd_sof_interrupt.
 static uint8_t uhd_pipes_nak_frozen;
 
+//! When true, the NAK throttle is NOT armed on new bulk transfers, so the
+//! hardware's continuous auto-retry is restored (full-speed bulk). The throttle
+//! only earns its keep when an idle poll competes with other pipes; during an
+//! exclusive USB mass-storage disk operation nothing else is on the bus, so
+//! throttling there only slows scene read/write. Toggled by
+//! uhd_bulk_nak_throttle_set(). volatile: read from the pipe ISR. (Independent
+//! of the compile-time UHD_NO_BULK_NAK_THROTTLE kill switch, which removes the
+//! throttle entirely; this is the runtime, disk-mode-scoped bypass.)
+//! Inverted sense (default 0 = armed) so it lives in .bss, not .data -- program
+//! flash is full on this branch and a =true initializer would overflow it.
+static volatile bool uhd_bulk_nak_throttle_off;
+
 //! Variables to manage the suspend/resume sequence
 static uint8_t uhd_suspend_start;
 static uint8_t uhd_resume_start;
@@ -637,6 +649,11 @@ uhd_speed_t uhd_get_speed(void)
 uint16_t uhd_get_frame_number(void)
 {
 	return uhd_get_sof_number();
+}
+
+void uhd_bulk_nak_throttle_set(bool enabled)
+{
+	uhd_bulk_nak_throttle_off = !enabled;
 }
 
 uint16_t uhd_get_microframe_number(void)
@@ -1771,7 +1788,8 @@ static void uhd_pipe_trans_complet(uint8_t pipe)
 						(next_trans+uhd_get_pipe_size(pipe)-1)/uhd_get_pipe_size(pipe));
 			}
 #ifndef UHD_NO_BULK_NAK_THROTTLE
-			if (USB_EP_TYPE_BULK == uhd_get_pipe_type(pipe)) {
+			if (USB_EP_TYPE_BULK == uhd_get_pipe_type(pipe)
+					&& !uhd_bulk_nak_throttle_off) {
 				// arm the NAK throttle (see uhd_pipes_nak_frozen)
 				uhd_ack_nak_received(pipe);
 				uhd_enable_nak_received_interrupt(pipe);
