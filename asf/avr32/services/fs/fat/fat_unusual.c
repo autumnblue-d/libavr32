@@ -53,9 +53,6 @@
 #include "fat.h"
 #include LIB_MEM
 
-#ifdef USB_TOPO_DEBUG
-#include "usb_dbg.h" // sector-0 content probe at the NO_FORMAT check
-#endif
 #include LIB_CTRLACCESS
 
 
@@ -141,13 +138,6 @@ bool  fat_mount( void )
       if ( (fs_g_sector[510] != FS_BR_SIGNATURE_LOW  )
       &&   (fs_g_sector[511] != FS_BR_SIGNATURE_HIGH ) )
       {
-#ifdef USB_TOPO_DEBUG
-         // What actually landed in the sector buffer: first two and last two
-         // bytes. All-zero = the transfer delivered nothing; valid-looking
-         // head with bad tail = short/shifted data.
-         usb_dbg_log2("s0a", fs_g_sector[0], fs_g_sector[1]);
-         usb_dbg_log2("s0z", fs_g_sector[510], fs_g_sector[511]);
-#endif
          fs_g_status = FS_ERR_NO_FORMAT;
          return false;
       }

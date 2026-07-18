@@ -7,9 +7,6 @@
 #include "cdc.h"
 #include "monome.h"
 
-#ifdef USB_TOPO_DEBUG
-#include "usb_dbg.h"
-#endif
 
 
 //------ defines
@@ -966,9 +963,6 @@ void monome_setup_mext() {
 	u8 w;
 	u8 *prx;
 
-#ifdef USB_TOPO_DEBUG
-	usb_dbg_push("mset"); // grid setup dialogue starting
-#endif
 
 	// set rxtx funcs
 	serial_read = &cdc_read;
@@ -993,9 +987,6 @@ void monome_setup_mext() {
 	prx = rx_buf();
 	print_dbg("\r\nreceived: ");
 	print_dbg_ulong(*prx);
-#ifdef USB_TOPO_DEBUG
-	usb_dbg_log_val("mrx", *prx); // 3 = SIZE reply; anything else = defaults
-#endif
 	if(*prx == 3) { // SIZE
 		prx++;
 		mdesc.cols = *prx;

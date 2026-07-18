@@ -56,9 +56,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-#ifdef USB_TOPO_DEBUG
-#include "usb_dbg.h" // IRQ-storm detector (usb_dbg_irq_tick)
-#endif
 
 // Fix the fact that, for some IAR header files, the AVR32_USBB_IRQ_GROUP
 // define has been defined as AVR32_USB_IRQ_GROUP instead.
@@ -836,11 +833,6 @@ bool uhd_ep_alloc(usb_add_t add, usb_ep_desc_t * ep_desc)
 		// Digitone MIDI bulk = 512). The full-speed USBB cannot allocate an
 		// oversized pipe, so cap non-isochronous endpoints at the FS maximum.
 		uint16_t max_pkt = le16_to_cpu(ep_desc->wMaxPacketSize);
-#ifdef USB_TOPO_DEBUG
-		// "epA <bEndpointAddress> <declared wMaxPacketSize>" — shows whether
-		// the FS clamp below actually fires for this endpoint.
-		usb_dbg_log2("epA", ep_desc->bEndpointAddress, max_pkt);
-#endif
 		if (ep_type != USB_EP_TYPE_ISOCHRONOUS && max_pkt > 64) {
 			max_pkt = 64;
 		}
@@ -1070,11 +1062,6 @@ static void uhd_interrupt(void)
 {
 	uint8_t pipe_int;
 
-#ifdef USB_TOPO_DEBUG
-	// Storm detector: UHINT names the pending interrupt (bit 8+p = pipe p,
-	// bit 5 = SOF), UHINTE the enabled mask. See usb_dbg.h.
-	usb_dbg_irq_tick(AVR32_USBB.uhint, AVR32_USBB.uhinte);
-#endif
 
 	// Manage SOF interrupt
 	if (Is_uhd_sof()) {
@@ -1952,22 +1939,6 @@ static void uhd_ep_abort_pipe(uint8_t pipe, uhd_trans_status_t status)
 	uhd_pipe_finish_job(pipe, status);
 }
 
-#ifdef USB_TOPO_DEBUG
-// Dump the live pipe table to the trace ring (one line per pipe 0..6):
-// "p<N> a<addr> e<ep> [E][F][C]" — target address, endpoint number,
-// Enabled / Frozen / Config-OK. Triggered from the module with ALT+F9.
-void uhd_dbg_dump_pipes(void)
-{
-	for (uint8_t p = 0; p < AVR32_USBB_EPT_NUM - 1; p++) {
-		usb_dbg_log_pipe(p,
-				uhd_get_configured_address(p),
-				uhd_get_pipe_endpoint_address(p),
-				(Is_uhd_pipe_enabled(p) ? 1 : 0) |
-				(Is_uhd_pipe_frozen(p) ? 2 : 0) |
-				(Is_uhd_pipe_configured(p) ? 4 : 0));
-	}
-}
-#endif
 
 /**
  * \internal

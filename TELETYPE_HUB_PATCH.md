@@ -89,9 +89,5 @@ behind the hub is rejected cleanly without disrupting other ports.
 
 ## Not included
 
-- The `USB_TOPO_DEBUG` on-screen trace facility: the libavr32 half is on this
-  branch (compile-gated, inert), but the module-side OLED overlay/key
-  bindings live only on the maintainer's teletype branch (`usb-dock-fixes`
-  there; see its `USB_DOCK_NOTES.md` for the trace legend).
 - The `trilogy`-branch `flash.c` reseed fixes — specific to that branch's
   enlarged flash layout.
