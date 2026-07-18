@@ -14,7 +14,10 @@
 #     path, define USB_HOST_HUB_SUPPORT (an application opt-in).
 #   module/main.c    — the three module-side USB behaviors:
 #     * MSC media gate: only enter the USB-disk dialog when a LUN reports
-#       ready media (an empty dock card reader otherwise hijacks the UI);
+#       ready media (an empty dock card reader otherwise hijacks the UI).
+#       FAIL/BUSY answers are polled through (a fresh drive walks unit
+#       attention before reporting ready); only "medium not present" is a
+#       definitive empty reader.
 #     * monome poll gating: no grid bulk traffic while a device enumerates;
 #     * deferred monome setup: run the grid setup dialogue only after 50 ms
 #       of enumeration quiet (grid-before-MIDI otherwise leaves a dark grid).
@@ -49,7 +52,7 @@ index 49a9cac..411683a 100644
  # Extra flags to use when linking
  # NVRAM size may need to change if additional data is to be stored in scenes.
 diff --git a/module/main.c b/module/main.c
-index 898f585..82f1254 100644
+index 898f585..9bae012 100644
 --- a/module/main.c
 +++ b/module/main.c
 @@ -49,6 +49,7 @@
@@ -70,7 +73,7 @@ index 898f585..82f1254 100644
      // asynchronous, non-blocking read
      // UHC callback spawns appropriate events
      serial_read();
-@@ -486,6 +490,26 @@ void handler_HidTimer(int32_t data) {
+@@ -486,6 +490,34 @@ void handler_HidTimer(int32_t data) {
  }
  
  void handler_MscConnect(int32_t data) {
@@ -79,25 +82,33 @@ index 898f585..82f1254 100644
 +    // bare connect event doesn't mean there's a drive to use. Only enter the
 +    // USB-disk dialog if a LUN reports ready media; otherwise an empty reader
 +    // (common in USB-C docks) would hijack the UI and block grid/HID until it's
-+    // physically unplugged. test-unit-ready is blocking; bound the BUSY spin so
-+    // a misbehaving drive can't hang the module.
++    // physically unplugged.
++    //
++    // A freshly-connected drive walks through unit-attention sense codes that
++    // ASF's default mapping reports as CTRL_FAIL (e.g. 0x29 power-on reset),
++    // then the LUN-change notification (CTRL_BUSY), before finally answering
++    // CTRL_GOOD — so FAIL and BUSY both mean "poll again". Only
++    // CTRL_NO_PRESENT (medium not present) is a definitive empty reader.
++    // test-unit-ready is blocking; the try budget bounds the wait so a
++    // misbehaving drive can't hang the module.
 +    bool media_ready = false;
 +    for (uint8_t lun = 0; lun < uhi_msc_mem_get_lun(); lun++) {
-+        Ctrl_status s = CTRL_BUSY;
-+        for (uint8_t tries = 0; tries < 20 && s == CTRL_BUSY; tries++) {
-+            s = uhi_msc_mem_test_unit_ready(lun);
++        for (uint8_t tries = 0; tries < 20; tries++) {
++            Ctrl_status s = uhi_msc_mem_test_unit_ready(lun);
++            if (s == CTRL_GOOD) {
++                media_ready = true;
++                break;
++            }
++            if (s == CTRL_NO_PRESENT) break; // definitive: no media in this LUN
 +        }
-+        if (s == CTRL_GOOD) {
-+            media_ready = true;
-+            break;
-+        }
++        if (media_ready) break;
 +    }
 +    if (!media_ready) return; // no media: stay in the normal app UI
 +
      // disable event handlers while doing USB write
      assign_msc_event_handlers();
  
-@@ -541,7 +565,24 @@ void handler_ScreenRefresh(int32_t data) {
+@@ -541,7 +573,24 @@ void handler_ScreenRefresh(int32_t data) {
  #endif
  }
  
@@ -122,7 +133,7 @@ index 898f585..82f1254 100644
      tele_tick(&scene_state, RATE_CLOCK);
  
      if (ss_counter < SS_TIMEOUT) {
-@@ -573,7 +614,7 @@ static void handler_FtdiConnect(s32 data) {
+@@ -573,7 +622,7 @@ static void handler_FtdiConnect(s32 data) {
  }
  
  static void handler_SerialConnect(s32 data) {
