@@ -1617,7 +1617,7 @@ bool  nav_setcwd( FS_STRING sz_path , bool b_match_case , bool b_create )
          if( !nav_drive_set( toupper(((FS_STR_UNICODE)sz_path )[0])-'A' ) )
             goto nav_setcwd_fail;
       }else{
-         if( !nav_drive_set( toupper(sz_path [0])-'A' ) )
+         if( !nav_drive_set( toupper((unsigned char)sz_path [0])-'A' ) )
             goto nav_setcwd_fail;
       }
       if( !nav_partition_mount())
