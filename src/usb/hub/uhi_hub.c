@@ -99,13 +99,13 @@ static uhd_speed_t hub_reset_speed = UHD_SPEED_FULL;
 uhd_speed_t uhi_hub_get_reset_speed(void) { return hub_reset_speed; }
 
 // forward decl: defined below, near the other get_hub_by_* helpers
-static uhi_hub_t* get_hub_by_dev(uhc_device_t* dev);
+static uhi_hub_t* hub_find(uhc_device_t* dev);
 
 // Mark `dev`'s downstream port as an unsupported low-speed device. Marking the
 // port stops uhc.c from re-enumerating it in a loop (see `rejected` above); the
 // bit is cleared when the device disconnects.
 void uhi_hub_reject_ls(uhc_device_t* dev) {
-	uhi_hub_t* hub = get_hub_by_dev(dev->hub);
+	uhi_hub_t* hub = hub_find(dev->hub);
 	if (hub != NULL && dev->hub_port >= 1 && dev->hub_port <= UHI_HUB_MAX_PORTS) {
 		hub->rejected |= (uint8_t)(1u << (dev->hub_port - 1));
 	}
@@ -127,12 +127,22 @@ static uhi_hub_t* get_hub_by_addr(usb_add_t add) {
 	return NULL;
 }
 
-// CAUTION: get_hub_by_dev(NULL) returns a FREE slot — uhi_hub_install relies
-// on this to allocate. Never call it with a possibly-NULL device pointer
-// expecting a "not found" result.
-static uhi_hub_t* get_hub_by_dev(uhc_device_t* dev) {
+// Find the hub slot bound to `dev`. Returns NULL if `dev` is NULL or not
+// found — NULL is never a match, so a caller passing a device with no hub
+// (dev->hub == NULL) gets a clean "not found" instead of a free slot.
+static uhi_hub_t* hub_find(uhc_device_t* dev) {
+	if (dev == NULL) return NULL;
 	for (uint8_t i = 0; i < UHI_HUB_MAX; i++) {
 		if (hubs[i].dev == dev) return &hubs[i];
+	}
+	return NULL;
+}
+
+// Claim a free hub slot (dev == NULL). Returns NULL if all slots are in use.
+// Only uhi_hub_install allocates; every other path uses hub_find().
+static uhi_hub_t* hub_alloc(void) {
+	for (uint8_t i = 0; i < UHI_HUB_MAX; i++) {
+		if (hubs[i].dev == NULL) return &hubs[i];
 	}
 	return NULL;
 }
@@ -226,7 +236,7 @@ uhc_enum_status_t uhi_hub_install(uhc_device_t* dev) {
 			if (!supported) break;
 			{
 				// Confirmed hub-class interface: now (and only now) claim a slot.
-				uhi_hub_t* hub = get_hub_by_dev(NULL);
+				uhi_hub_t* hub = hub_alloc();
 				if (hub == NULL) return UHC_ENUM_SOFTWARE_LIMIT;
 				if (!uhd_ep_alloc(dev->address, (usb_ep_desc_t*)iface)) {
 					return UHC_ENUM_HARDWARE_LIMIT;
@@ -257,7 +267,7 @@ uhc_enum_status_t uhi_hub_install(uhc_device_t* dev) {
 //   Fetch hub descriptor, then power each port, then arm the status poll.
 //--------------------------------------------------------------------+
 void uhi_hub_enable(uhc_device_t* dev) {
-	uhi_hub_t* hub = get_hub_by_dev(dev);
+	uhi_hub_t* hub = hub_find(dev);
 	if (hub == NULL) return;
 	hub->enable_retries = 0;
 	hub_enable_start(hub);
@@ -568,7 +578,7 @@ static void hub_reset_fail(uhi_hub_t* hub) {
 //   least one control-transfer round-trip. TRSTRCY recovery after the reset
 //   is provided by uhc.c's SOF timeouts (steps 2/4), not here.
 void uhi_hub_send_reset(uhc_device_t* dev, uhd_callback_reset_t callback) {
-	uhi_hub_t* hub = get_hub_by_dev(dev->hub);
+	uhi_hub_t* hub = hub_find(dev->hub);
 	if (hub == NULL) { if (callback) callback(); return; }
 
 	hub->reset_cb    = callback;
@@ -638,7 +648,7 @@ static void on_reset_cleared(usb_add_t add, uhd_trans_status_t status,
 
 // Suspend the hub port `dev` is on. (TinyUSB: SET_FEATURE PORT_SUSPEND)
 void uhi_hub_suspend(uhc_device_t* dev) {
-	uhi_hub_t* hub = get_hub_by_dev(dev->hub);
+	uhi_hub_t* hub = hub_find(dev->hub);
 	if (hub == NULL) return;
 	port_set_feature(hub->dev->address, dev->hub_port, HUB_FEAT_PORT_SUSPEND, NULL);
 }
@@ -647,7 +657,7 @@ void uhi_hub_suspend(uhc_device_t* dev) {
 // UHI: uninstall  (TinyUSB: hub_close, hub.c:244-252)
 //--------------------------------------------------------------------+
 void uhi_hub_uninstall(uhc_device_t* dev) {
-	uhi_hub_t* hub = get_hub_by_dev(dev);
+	uhi_hub_t* hub = hub_find(dev);
 	if (hub == NULL) return;
 	// Downstream devices are torn down by uhc_connection_tree's root-unplug
 	// sweep in uhc.c before this runs; the slot only needs clearing here.
@@ -659,7 +669,7 @@ void uhi_hub_uninstall(uhc_device_t* dev) {
 // again — this is what lets a SECOND device (e.g. a keyboard after the grid) be
 // detected. Serializes cleanly: enumerate -> resume -> detect next.
 void uhi_hub_poll_resume(uhc_device_t* hub_dev) {
-	uhi_hub_t* hub = get_hub_by_dev(hub_dev);
+	uhi_hub_t* hub = hub_find(hub_dev);
 	if (hub != NULL) {
 		hub_start_status_poll(hub);
 	}
