@@ -5,6 +5,9 @@
   usb MIDI functions.
 */
 
+#include <stdlib.h>
+#include <string.h>
+
 // asf
 #include "interrupt.h" // cpu_irq_save/restore for the TX-queue kick
 #include "print_funcs.h"
@@ -42,23 +45,6 @@ typedef union {
   u32 raw;
 } usb_midi_event_t;
 
-//------------------------------------
-//------ static variables
-// 
-
-static bool midi_connected = false;
-// buffers must be word aligned per docs on uhd_ep_run()
-COMPILER_WORD_ALIGNED static usb_midi_event_t rxBuf[MIDI_RX_EVENT_BUF_SIZE];
-static volatile bool rxBusy = false;
-static u32 rxBytes = 0;
-
-// try using an output buffer and adding the extra nib we saw on input ...
-COMPILER_WORD_ALIGNED static usb_midi_event_t txBuf[MIDI_TX_EVENT_BUF_SIZE];
-static volatile bool txBusy = false;
-static volatile u8 txGetIdx = 0;
-static volatile u8 txPutIdx = 0;
-static volatile u8 txInFlight = 0; // events in the current (batched) transfer
-
 // System Real-Time messages (Clock/Start/Continue/Stop, status >= 0xF8) get
 // their own ring, drained ahead of the normal ring by midi_tx_start(). This
 // keeps transport/clock bytes from (a) being dropped when a note burst has
@@ -67,13 +53,45 @@ static volatile u8 txInFlight = 0; // events in the current (batched) transfer
 // still can't preempt a transfer already on the wire, but it goes out on the
 // very next one. 8 * 4 B = 32 B; ample since these drain ~1 event/USB frame.
 #define MIDI_RT_EVENT_BUF_SIZE 8
-COMPILER_WORD_ALIGNED static usb_midi_event_t rtBuf[MIDI_RT_EVENT_BUF_SIZE];
-static volatile u8 rtGetIdx = 0;
-static volatile u8 rtPutIdx = 0;
-static volatile u8 rtInFlight = 0; // realtime events in the current transfer
-static volatile bool rtActive = false; // is the in-flight transfer from rtBuf?
 
-static void midi_tx_start(void); // starts a batched transfer; caller holds txBusy
+// Cached USB product-name string per device slot, truncated to fit one OLED
+// line (~21 chars at 6px/char on a 128px-wide line).
+#define MIDI_DEV_NAME_LEN 21
+
+//------------------------------------
+//------ static variables
+//
+
+// Per-device I/O state. One entry per connected USB MIDI device; the slot index
+// matches the driver's device slot (uhi_midi.c), so a transfer callback maps the
+// USB address it is handed back to a slot via uhi_midi_slot_by_add(). Buffers
+// come first and the array is word-aligned so each rx/tx/rt buffer stays word
+// aligned per the uhd_ep_run() docs.
+typedef struct {
+  usb_midi_event_t rxBuf[MIDI_RX_EVENT_BUF_SIZE];
+  usb_midi_event_t txBuf[MIDI_TX_EVENT_BUF_SIZE];
+  usb_midi_event_t rtBuf[MIDI_RT_EVENT_BUF_SIZE];
+
+  bool connected;
+  char name[MIDI_DEV_NAME_LEN];
+
+  volatile bool rxBusy;
+  u32 rxBytes;
+
+  volatile bool txBusy;
+  volatile u8 txGetIdx;
+  volatile u8 txPutIdx;
+  volatile u8 txInFlight; // events in the current (batched) transfer
+
+  volatile u8 rtGetIdx;
+  volatile u8 rtPutIdx;
+  volatile u8 rtInFlight; // realtime events in the current transfer
+  volatile bool rtActive; // is the in-flight transfer from rtBuf?
+} midi_dev_state_t;
+
+COMPILER_WORD_ALIGNED static midi_dev_state_t midi_devs[UHI_MIDI_MAX_DEV];
+
+static void midi_tx_start(u8 dev); // starts a batched transfer; caller holds txBusy
 
 // current packet data
 static event_t ev = { .type = kEventMidiPacket, .data = 0x00000000 };
@@ -81,21 +99,24 @@ static event_t ev = { .type = kEventMidiPacket, .data = 0x00000000 };
 //------------------------------------
 //----- static functions
 
-// parse the buffer and spawn appropriate events
-static void midi_parse_event(void) {
+// parse device `dev`'s rx buffer and spawn appropriate events
+static void midi_parse_event(u8 dev) {
+  midi_dev_state_t* d = &midi_devs[dev];
   int i;
-  int eventCount = rxBytes >> 2; // assume we receive full events, partials are dropped
+  int eventCount = d->rxBytes >> 2; // assume full events; partials are dropped
 
   union { u32 data; s32 sdata; } buf;
 
-  usb_midi_event_t* rxEvent = &(rxBuf[0]);
+  usb_midi_event_t* rxEvent = &(d->rxBuf[0]);
 
   for (i = 0; i < eventCount; i++) {
     // shift the 3-byte MIDI message into bits 8..31 (as midi_packet_parse
-    // expects) and stash the virtual cable number (header high nibble) in the
-    // otherwise-unused low byte so downstream code can tell which port it came
-    // from (e.g. MIDISPORT port A = cable 0, port B = cable 1).
-    buf.data = (rxEvent->raw << 8) | (rxEvent->header >> 4);
+    // expects) and pack per-event metadata into the otherwise-unused low byte:
+    //   low nibble  = virtual cable (MIDISPORT port A = 0, port B = 1, ...)
+    //   high nibble = device slot (which physical MIDI device it arrived on)
+    // both are <= 15. midi_packet_parse only reads bits 8..31.
+    buf.data = (rxEvent->raw << 8) | (((u32)dev & 0x0f) << 4)
+               | (rxEvent->header >> 4);
     ev.data = buf.sdata;
     event_post(&ev);
 
@@ -103,19 +124,26 @@ static void midi_parse_event(void) {
   }
 }
 
-// callback for the non-blocking asynchronous read.
+// callback for the non-blocking asynchronous read. The transfer callback carries
+// only the USB address, so map it back to a device slot.
 static void midi_rx_done(usb_add_t add,
                          usb_ep_t ep,
                          uhd_trans_status_t stat,
                          iram_size_t nb) {
+  (void)ep;
+  uint8_t slot = uhi_midi_slot_by_add(add);
+  if (slot == UHI_MIDI_NO_SLOT) {
+    return; // device left between issuing the read and its completion
+  }
+  midi_dev_state_t* d = &midi_devs[slot];
   if (nb > 0) {
     if (stat == UHD_TRANS_NOERROR) {
-      rxBytes = nb;
-      midi_parse_event();
+      d->rxBytes = nb;
+      midi_parse_event(slot);
     }
   }
 
-  rxBusy = false;
+  d->rxBusy = false;
 }
 
 // callback for the non-blocking asynchronous write. Runs in the USB
@@ -127,25 +155,29 @@ static void midi_tx_done(usb_add_t add,
                          usb_ep_t ep,
                          uhd_trans_status_t stat,
                          iram_size_t nb) {
-  (void)add;
   (void)ep;
   (void)nb;
+  uint8_t slot = uhi_midi_slot_by_add(add);
+  if (slot == UHI_MIDI_NO_SLOT) {
+    return; // device left mid-transfer; its state was already reset
+  }
+  midi_dev_state_t* d = &midi_devs[slot];
   if (stat != UHD_TRANS_NOERROR) {
     print_dbg("\r\n midi tx error (in callback). status: 0x");
     print_dbg_hex((u32)stat);
   }
 
-  if (rtActive) {
-    rtGetIdx = (rtGetIdx + rtInFlight) % MIDI_RT_EVENT_BUF_SIZE;
-    rtInFlight = 0;
+  if (d->rtActive) {
+    d->rtGetIdx = (d->rtGetIdx + d->rtInFlight) % MIDI_RT_EVENT_BUF_SIZE;
+    d->rtInFlight = 0;
   } else {
-    txGetIdx = (txGetIdx + txInFlight) % MIDI_TX_EVENT_BUF_SIZE;
-    txInFlight = 0;
+    d->txGetIdx = (d->txGetIdx + d->txInFlight) % MIDI_TX_EVENT_BUF_SIZE;
+    d->txInFlight = 0;
   }
-  if (rtGetIdx != rtPutIdx || txGetIdx != txPutIdx) {
-    midi_tx_start(); // more queued: chain the next batch (txBusy stays true)
+  if (d->rtGetIdx != d->rtPutIdx || d->txGetIdx != d->txPutIdx) {
+    midi_tx_start(slot); // more queued: chain the next batch (txBusy stays true)
   } else {
-    txBusy = false; // both rings drained
+    d->txBusy = false; // both rings drained
   }
 }
 
@@ -155,22 +187,23 @@ static void midi_tx_done(usb_add_t add,
 // lets a dense burst drain fast enough: one event per transfer (~1 USB frame
 // each) can't keep up with Kria's bursts, so the ring overflowed and dropped
 // note-ons. Caller must already hold txBusy and ensure the ring is non-empty.
-static void midi_tx_start(void) {
+static void midi_tx_start(u8 dev) {
+  midi_dev_state_t* d = &midi_devs[dev];
   // Realtime ring first: transport/clock bytes jump ahead of queued notes.
-  if (rtGetIdx != rtPutIdx) {
-    u8 run = (rtPutIdx > rtGetIdx) ? (u8)(rtPutIdx - rtGetIdx)
-                                   : (u8)(MIDI_RT_EVENT_BUF_SIZE - rtGetIdx);
-    rtInFlight = run;
-    rtActive = true;
-    uhi_midi_out_run((uint8_t*)&rtBuf[rtGetIdx],
+  if (d->rtGetIdx != d->rtPutIdx) {
+    u8 run = (d->rtPutIdx > d->rtGetIdx) ? (u8)(d->rtPutIdx - d->rtGetIdx)
+                                         : (u8)(MIDI_RT_EVENT_BUF_SIZE - d->rtGetIdx);
+    d->rtInFlight = run;
+    d->rtActive = true;
+    uhi_midi_out_run(dev, (uint8_t*)&d->rtBuf[d->rtGetIdx],
                      run * sizeof(usb_midi_event_t), &midi_tx_done);
     return;
   }
-  rtActive = false;
-  u8 run = (txPutIdx >= txGetIdx) ? (u8)(txPutIdx - txGetIdx)
-                                  : (u8)(MIDI_TX_EVENT_BUF_SIZE - txGetIdx);
-  txInFlight = run;
-  uhi_midi_out_run((uint8_t*)&txBuf[txGetIdx],
+  d->rtActive = false;
+  u8 run = (d->txPutIdx >= d->txGetIdx) ? (u8)(d->txPutIdx - d->txGetIdx)
+                                        : (u8)(MIDI_TX_EVENT_BUF_SIZE - d->txGetIdx);
+  d->txInFlight = run;
+  uhi_midi_out_run(dev, (uint8_t*)&d->txBuf[d->txGetIdx],
                    run * sizeof(usb_midi_event_t), &midi_tx_done);
 }
 
@@ -178,27 +211,33 @@ static void midi_tx_start(void) {
 //-----------------------------------------
 //----- extern functions
 
-// read and spawn events (non-blocking)
+// read and spawn events (non-blocking); poll every connected device
 extern void midi_read(void) {
-  if(!midi_connected) {
-    return;
-  }
-  if (rxBusy == false) {
-    rxBusy = true;
-    rxBytes = 0;
-    if (!uhi_midi_in_run((u8*)rxBuf, sizeof rxBuf, &midi_rx_done)) {
-      // hm, every uhd enpoint run always returns error...
-      // ...because most of the time a rx job is already running, by only
-      // running the endpoint read after midi_rx_done has set rxBusy to false
-      // the errors here stop.
-      print_dbg("\r\n midi rx endpoint error");
+  for (u8 i = 0; i < UHI_MIDI_MAX_DEV; i++) {
+    midi_dev_state_t* d = &midi_devs[i];
+    if (!d->connected) {
+      continue;
+    }
+    if (d->rxBusy == false) {
+      d->rxBusy = true;
+      d->rxBytes = 0;
+      if (!uhi_midi_in_run(i, (u8*)d->rxBuf, sizeof d->rxBuf, &midi_rx_done)) {
+        // The read did not start (e.g. the device just left), so no callback
+        // will fire to clear rxBusy — clear it here so the next poll retries.
+        d->rxBusy = false;
+        print_dbg("\r\n midi rx endpoint error");
+      }
     }
   }
   return;
 }
 
-// write to MIDI device
-extern bool midi_write(const u8* data, u32 bytes) {
+// write to MIDI device `device`
+extern bool midi_write(u8 device, const u8* data, u32 bytes) {
+  if (device >= UHI_MIDI_MAX_DEV || !midi_devs[device].connected) {
+    return false;
+  }
+  midi_dev_state_t* dev = &midi_devs[device];
   // NB: this function is not currently used across the module code
   // base therefore the precise nature of the incoming buffer layout
   // is not well defined.
@@ -212,15 +251,15 @@ extern bool midi_write(const u8* data, u32 bytes) {
 	// msgs in data are dropped
 
   u8 events = 1;
-  usb_midi_event_t* tx = &(txBuf[0]);
-  const usb_midi_event_t* txEnd = &(txBuf[MIDI_RX_EVENT_BUF_SIZE]);
+  usb_midi_event_t* tx = &(dev->txBuf[0]);
+  const usb_midi_event_t* txEnd = &(dev->txBuf[MIDI_RX_EVENT_BUF_SIZE]);
 
   u8* d = (u8*)data;
   const u8* dEnd = data + bytes;
 
   u8 status, com, ch;
 
-  if (txBusy == false) {
+  if (dev->txBusy == false) {
     print_dbg("\r\n midi_write: no buffers available");
     return false;
   }
@@ -286,9 +325,9 @@ extern bool midi_write(const u8* data, u32 bytes) {
     tx++; events++;
   }
 
-  txBusy = true;
+  dev->txBusy = true;
 
-  if (!uhi_midi_out_run((uint8_t*)txBuf, events * sizeof(usb_midi_event_t), &midi_tx_done)) {
+  if (!uhi_midi_out_run(device, (uint8_t*)dev->txBuf, events * sizeof(usb_midi_event_t), &midi_tx_done)) {
     // hm, every uhd enpoint run always returns unspecified error...
     //  print_dbg("\r\n midi tx endpoint error");
   }
@@ -303,10 +342,11 @@ extern bool midi_write(const u8* data, u32 bytes) {
 // buffer to the asynchronous DMA and spin-waited AFTER writing it — so a rapid
 // second call (e.g. Kria firing several tracks on one clock step) clobbered the
 // first packet's in-flight buffer, corrupting/dropping notes.
-extern void midi_write_packet(u8 cable_number, u8 *pack) {
-  if (!midi_connected) {
+extern void midi_write_packet(u8 device, u8 cable_number, u8 *pack) {
+  if (device >= UHI_MIDI_MAX_DEV || !midi_devs[device].connected) {
     return;
   }
+  midi_dev_state_t* dev = &midi_devs[device];
   // System Real-Time (status >= 0xF8) uses the priority ring; everything else
   // the normal ring. A full realtime ring is near-impossible in practice (it
   // drains a message per USB frame), but if it happens we still drop rather
@@ -314,22 +354,22 @@ extern void midi_write_packet(u8 cable_number, u8 *pack) {
   bool is_realtime = pack[0] >= 0xF8;
   usb_midi_event_t* e;
   if (is_realtime) {
-    u8 next = (rtPutIdx + 1) % MIDI_RT_EVENT_BUF_SIZE;
-    if (next == rtGetIdx) {
+    u8 next = (dev->rtPutIdx + 1) % MIDI_RT_EVENT_BUF_SIZE;
+    if (next == dev->rtGetIdx) {
       print_dbg("\r\n midi tx realtime queue full, dropping packet");
       return;
     }
-    e = &rtBuf[rtPutIdx];
-    rtPutIdx = next;
+    e = &dev->rtBuf[dev->rtPutIdx];
+    dev->rtPutIdx = next;
   } else {
-    u8 next = (txPutIdx + 1) % MIDI_TX_EVENT_BUF_SIZE;
-    if (next == txGetIdx) {
+    u8 next = (dev->txPutIdx + 1) % MIDI_TX_EVENT_BUF_SIZE;
+    if (next == dev->txGetIdx) {
       // Ring full: drop rather than block or corrupt an in-flight one.
       print_dbg("\r\n midi tx queue full, dropping packet");
       return;
     }
-    e = &txBuf[txPutIdx];
-    txPutIdx = next;
+    e = &dev->txBuf[dev->txPutIdx];
+    dev->txPutIdx = next;
   }
   // USB-MIDI event: header = (cable << 4) | CIN. For channel-voice messages
   // (0x8-0xE) and system-real-time (0xF8-0xFF, single byte) the status high
@@ -353,42 +393,85 @@ extern void midi_write_packet(u8 cable_number, u8 *pack) {
   // interrupts masked so we don't race midi_tx_done (ISR) clearing it. When we
   // win the claim no transfer is in flight, so reading txGetIdx here is safe.
   irqflags_t flags = cpu_irq_save();
-  bool start = !txBusy;
+  bool start = !dev->txBusy;
   if (start) {
-    txBusy = true;
+    dev->txBusy = true;
   }
   cpu_irq_restore(flags);
   if (start) {
-    midi_tx_start(); // batches all currently-queued events into one transfer
+    midi_tx_start(device); // batches all currently-queued events into one transfer
   }
 }
 
-// MIDI device was plugged or unplugged
+// MIDI device was plugged or unplugged. The driver clears its slot only after
+// this returns on unplug (see uhi_midi_uninstall), so uhi_midi_slot_by_add()
+// resolves the slot in both directions.
 extern void midi_change(uhc_device_t* dev, u8 plug) {
   event_t e;
 
+  uint8_t slot = uhi_midi_slot_by_add(dev->address);
+  if (slot == UHI_MIDI_NO_SLOT) {
+    return;
+  }
+  midi_dev_state_t* d = &midi_devs[slot];
+
+  // Reset this device's rings either way (connect = fresh start; disconnect =
+  // drop anything queued for the departed device).
+  d->rxBusy = false;
+  d->txBusy = false;
+  d->txGetIdx = d->txPutIdx = 0;
+  d->txInFlight = 0;
+  d->rtGetIdx = d->rtPutIdx = 0;
+  d->rtInFlight = 0;
+  d->rtActive = false;
+
   if (plug) {
-    midi_connected = true;
-    rxBusy = false;
-    txBusy = false;
-    txGetIdx = txPutIdx = 0; // reset the TX ring
-    txInFlight = 0;
-    rtGetIdx = rtPutIdx = 0; // reset the realtime ring
-    rtInFlight = 0;
-    rtActive = false;
+    d->connected = true;
+    d->name[0] = '\0';  // fetched later, off the main loop -- see midi_dev_fetch_name()
     e.type = kEventMidiConnect;
   } else {
-    midi_connected = false;
-    txBusy = false;
-    txGetIdx = txPutIdx = 0; // drop anything queued for the departed device
-    txInFlight = 0;
-    rtGetIdx = rtPutIdx = 0;
-    rtInFlight = 0;
-    rtActive = false;
+    d->connected = false;
+    d->name[0] = '\0';
     e.type = kEventMidiDisconnect;
   }
 
+  // carry the device slot so the main loop can tell which device changed
+  e.data = slot;
+
   // posting an event so the main loop can respond
-  event_post(&e); 
+  event_post(&e);
+}
+
+// Fetch and cache the USB product-name string for device slot `dev`. Does a
+// blocking control transfer (uhc_dev_get_string_product()), so this must only
+// be called from ordinary main-loop context (e.g. the ScreenRefresh handler),
+// never from midi_change()/uhi_midi_enable() -- those run synchronously inside
+// the UHC enumeration's own interrupt-driven setup-request callback chain, and
+// a nested blocking transfer there deadlocks waiting for an interrupt that
+// can't fire until the current callback returns.
+void midi_dev_fetch_name(u8 dev) {
+  if (dev >= UHI_MIDI_MAX_DEV || !midi_devs[dev].connected) return;
+
+  uhc_device_t* d = uhi_midi_slot_dev(dev);
+  if (d == NULL) return;
+
+  char* product = uhc_dev_get_string_product(d);
+  if (product) {
+    strncpy(midi_devs[dev].name, product, MIDI_DEV_NAME_LEN - 1);
+    midi_devs[dev].name[MIDI_DEV_NAME_LEN - 1] = '\0';
+    free(product);
+  } else {
+    strcpy(midi_devs[dev].name, "MIDI");
+  }
+}
+
+bool midi_dev_connected(u8 dev) {
+  if (dev >= UHI_MIDI_MAX_DEV) return false;
+  return midi_devs[dev].connected;
+}
+
+const char* midi_dev_name(u8 dev) {
+  if (dev >= UHI_MIDI_MAX_DEV) return "";
+  return midi_devs[dev].name;
 }
 

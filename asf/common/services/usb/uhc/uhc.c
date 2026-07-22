@@ -1329,7 +1329,6 @@ char *uhc_dev_get_string(uhc_device_t * dev, uint8_t str_id)
 	usb_str_lgid_desc_t *str_desc;
 	char *string;
 	uint8_t i;
-	UNUSED(dev);
 
 	req.bmRequestType = USB_REQ_RECIP_DEVICE|USB_REQ_TYPE_STANDARD|USB_REQ_DIR_IN;
 	req.bRequest = USB_REQ_GET_DESCRIPTOR;
@@ -1339,7 +1338,7 @@ char *uhc_dev_get_string(uhc_device_t * dev, uint8_t str_id)
 
 	// Get the size of string
 	uhc_setup_request_finish = false;
-	if (!uhd_setup_request(0,
+	if (!uhd_setup_request(dev->address,
 			&req,
 			(uint8_t*)&str_header,
 			sizeof(usb_str_desc_t),
@@ -1358,7 +1357,7 @@ char *uhc_dev_get_string(uhc_device_t * dev, uint8_t str_id)
 	}
 	req.wLength = str_header.bLength;
 	uhc_setup_request_finish = false;
-	if (!uhd_setup_request(0,
+	if (!uhd_setup_request(dev->address,
 			&req,
 			(uint8_t*)str_desc,
 			str_header.bLength,

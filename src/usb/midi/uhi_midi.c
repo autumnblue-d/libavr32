@@ -43,14 +43,31 @@ typedef struct {
 
 //----- static variables
 
-// device data
-static uhi_midi_dev_t uhi_midi_dev = {
-  .dev = NULL,
-  .ep_in = 0xf,
-  .ep_out = 0xf,
-};
+// device data: one slot per simultaneously-connected MIDI device. A slot is
+// free when .dev == NULL.
+static uhi_midi_dev_t uhi_midi_devs[UHI_MIDI_MAX_DEV];
 
 //------- static funcs
+
+// find the slot holding `dev`, or -1 if none
+static int uhi_midi_find_slot(uhc_device_t* dev) {
+  for (uint8_t i = 0; i < UHI_MIDI_MAX_DEV; i++) {
+    if (uhi_midi_devs[i].dev == dev) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// find a free slot (.dev == NULL), or -1 if all are taken
+static int uhi_midi_free_slot(void) {
+  for (uint8_t i = 0; i < UHI_MIDI_MAX_DEV; i++) {
+    if (uhi_midi_devs[i].dev == NULL) {
+      return i;
+    }
+  }
+  return -1;
+}
 
 // send control request
 /* static u8 send_ctl_request(u8 reqtype, u8 reqnum,  */
@@ -109,10 +126,15 @@ uhc_enum_status_t uhi_midi_install(uhc_device_t* dev) {
     uint16_t conf_desc_lgt;
     //, vid, pid;
     usb_iface_desc_t *ptr_iface;
-  
 
-    if (uhi_midi_dev.dev != NULL) {
-        return UHC_ENUM_SOFTWARE_LIMIT; // Device already allocated
+    // Endpoints are parsed into locals and only committed to a device slot once
+    // the interface is confirmed as MIDI, so a rejected device leaves no partial
+    // slot state.
+    usb_ep_t ep_in = 0xf;
+    usb_ep_t ep_out = 0xf;
+
+    if (uhi_midi_free_slot() < 0) {
+        return UHC_ENUM_SOFTWARE_LIMIT; // All MIDI slots in use
     }
 
     conf_desc_lgt = le16_to_cpu(dev->conf_desc->wTotalLength);
@@ -153,8 +175,8 @@ uhc_enum_status_t uhi_midi_install(uhc_device_t* dev) {
                     print_dbg("\r\n class/subclass matches audio/MIDI. ");
                 #endif
                 iface_supported = true;
-                uhi_midi_dev.ep_in = 0;
-                uhi_midi_dev.ep_out = 0;
+                ep_in = 0;
+                ep_out = 0;
             } else {
                 //// we want to check for class-specific MS interface? (type: .... TODO)
                 #if UHI_MIDI_PRINT_DBG
@@ -186,11 +208,11 @@ uhc_enum_status_t uhi_midi_install(uhc_device_t* dev) {
                 print_dbg("\r\n allocating bulk endpoint ( ");
                 if (((usb_ep_desc_t*)ptr_iface)->bEndpointAddress & USB_EP_DIR_IN) {
                   print_dbg(" input )");
-                  uhi_midi_dev.ep_in = ((usb_ep_desc_t*)ptr_iface)->bEndpointAddress;
+                  ep_in = ((usb_ep_desc_t*)ptr_iface)->bEndpointAddress;
 
                 } else {
                   print_dbg(" output )");
-                  uhi_midi_dev.ep_out = ((usb_ep_desc_t*)ptr_iface)->bEndpointAddress;
+                  ep_out = ((usb_ep_desc_t*)ptr_iface)->bEndpointAddress;
                 }
                 break;
             default:
@@ -215,7 +237,14 @@ uhc_enum_status_t uhi_midi_install(uhc_device_t* dev) {
     }
 
     if (iface_supported) {
-        uhi_midi_dev.dev = dev;
+        // Enumeration is serialized, so the slot found free above is still free.
+        int slot = uhi_midi_free_slot();
+        if (slot < 0) {
+            return UHC_ENUM_SOFTWARE_LIMIT; // shouldn't happen
+        }
+        uhi_midi_devs[slot].dev = dev;
+        uhi_midi_devs[slot].ep_in = ep_in;
+        uhi_midi_devs[slot].ep_out = ep_out;
         print_dbg("\r\n completed MIDI device install");
         return UHC_ENUM_SUCCESS;
     }
@@ -227,7 +256,7 @@ void uhi_midi_enable(uhc_device_t* dev) {
 
   /* print_dbg("\r\n midi enable routine "); */
 
-  if (uhi_midi_dev.dev != dev) {
+  if (uhi_midi_find_slot(dev) < 0) {
     return;  // No interface to enable
   }
 
@@ -247,35 +276,58 @@ void uhi_midi_enable(uhc_device_t* dev) {
 }
 
 void uhi_midi_uninstall(uhc_device_t* dev) {
-  if (uhi_midi_dev.dev != dev) {
+  int slot = uhi_midi_find_slot(dev);
+  if (slot < 0) {
     return; // Device not enabled in this interface
   }
-  uhi_midi_dev.dev = NULL;
-  Assert(uhi_midi_dev.report!=NULL);
-  midi_change(dev, false);  
+  // Notify while the slot still resolves via uhi_midi_slot_by_add(), then clear.
+  midi_change(dev, false);
+  uhi_midi_devs[slot].dev = NULL;
+  uhi_midi_devs[slot].ep_in = 0xf;
+  uhi_midi_devs[slot].ep_out = 0xf;
 }
 
-bool uhi_midi_in_run(uint8_t * buf, iram_size_t buf_size,
-             uhd_callback_trans_t callback) {
+// map a USB address back to a device slot; transfer callbacks carry only the
+// address, not a device handle (see uhd_callback_trans_t).
+uint8_t uhi_midi_slot_by_add(usb_add_t add) {
+  for (uint8_t i = 0; i < UHI_MIDI_MAX_DEV; i++) {
+    if (uhi_midi_devs[i].dev != NULL && uhi_midi_devs[i].dev->address == add) {
+      return i;
+    }
+  }
+  return UHI_MIDI_NO_SLOT;
+}
 
-  // print_dbg("\r\n attempting to run midi input endpoint ; dev address: 0x");
-  // print_dbg_hex((u32) (uhi_midi_dev.dev->address) );
-  // print_dbg(" , endpoint number: ");
-  // print_dbg_ulong((u32) (uhi_midi_dev.ep_in) );
-  
+bool uhi_midi_slot_connected(uint8_t idx) {
+  return idx < UHI_MIDI_MAX_DEV && uhi_midi_devs[idx].dev != NULL;
+}
+
+// device handle for slot `idx`, or NULL. For use outside the enumeration
+// callback chain only (e.g. deferred, main-loop-context string descriptor
+// reads) -- see midi_dev_fetch_name().
+uhc_device_t* uhi_midi_slot_dev(uint8_t idx) {
+  if (idx >= UHI_MIDI_MAX_DEV) return NULL;
+  return uhi_midi_devs[idx].dev;
+}
+
+bool uhi_midi_in_run(uint8_t idx, uint8_t * buf, iram_size_t buf_size,
+             uhd_callback_trans_t callback) {
+  if (!uhi_midi_slot_connected(idx)) {
+    return false;
+  }
 
   return uhd_ep_run(
-            uhi_midi_dev.dev->address,
-            uhi_midi_dev.ep_in, 
+            uhi_midi_devs[idx].dev->address,
+            uhi_midi_devs[idx].ep_in,
             //          false,  // shortpacket...
             //// TEST:
-            true, 
+            true,
             buf, buf_size,
-            UHI_MIDI_TIMEOUT, 
+            UHI_MIDI_TIMEOUT,
             callback);
 }
 
-bool uhi_midi_out_run(uint8_t * buf, iram_size_t buf_size,
+bool uhi_midi_out_run(uint8_t idx, uint8_t * buf, iram_size_t buf_size,
               uhd_callback_trans_t callback) {
   /*
     from uhd.h
@@ -287,16 +339,15 @@ bool uhi_midi_out_run(uint8_t * buf, iram_size_t buf_size,
     * at the end of the data transfer (received short packet).
     *
    */
-  // print_dbg("\r\n attempting to run midi output endpoint ; dev address: 0x");
-  // print_dbg_hex((u32) (uhi_midi_dev.dev->address) );
-  // print_dbg(" , endpoint number: ");
-  // print_dbg_ulong((u32) (uhi_midi_dev.ep_out) );
-  
+  if (!uhi_midi_slot_connected(idx)) {
+    return false;
+  }
+
   return uhd_ep_run(
-            uhi_midi_dev.dev->address,
-            uhi_midi_dev.ep_out, 
+            uhi_midi_devs[idx].dev->address,
+            uhi_midi_devs[idx].ep_out,
             true, // automatic shortpacket for buf < wlen
             buf, buf_size,
-            UHI_MIDI_TIMEOUT, 
+            UHI_MIDI_TIMEOUT,
             callback);
 }
