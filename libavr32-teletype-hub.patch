@@ -5,10 +5,9 @@
 # branch (provides src/usb/hub/uhi_hub.{c,h}, the hub-aware uhc.c, the USBB
 # bulk NAK throttle, and the runtime uhd_bulk_nak_throttle_set() bypass).
 #
-# !! FLASH LAYOUT CHANGE: the NVRAM region shrinks 200K -> 199K to make room
-# !! for the hub driver. Its base address moves, so the FIRST BOOT AFTER
-# !! FLASHING RE-SEEDS ALL SAVED SCENES. Back scenes up (WRITE TO USB) on
-# !! your current firmware before flashing this one.
+# !! FLASH LAYOUT CHANGE: NVRAM shrinks 200K -> 199K, so the FIRST BOOT AFTER
+# !! FLASHING RE-SEEDS ALL SAVED SCENES — back them up (WRITE TO USB) first.
+# !! See the config.mk hunk below for the full rationale.
 #
 # Apply from the teletype repo root:
 #   git apply --check libavr32/libavr32-teletype-hub.patch   # dry run
