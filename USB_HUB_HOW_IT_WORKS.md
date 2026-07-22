@@ -192,10 +192,17 @@ detect next.
 
 The clever leverage: **grid = serial (FTDI/CDC), keyboard = HID, MIDI controller
 = MIDI** are all *different classes*. Since UHC dispatches to one driver per class
-and each existing singleton driver claims exactly one device, mixed-class combos
-(grid + keyboard + MIDI) need **only** the new hub layer — no per-driver
-multi-instancing. That's why the change is as small as it is. Two devices of the
-*same* class (two keyboards) would need further per-driver work that isn't done.
+and each existing driver claims a device, mixed-class combos (grid + keyboard +
+MIDI) need **only** the new hub layer — no per-driver multi-instancing. That's
+why the change is as small as it is.
+
+Same-class duplicates are a separate axis, and one driver has crossed it:
+**MIDI is multi-instanced** — `UHI_MIDI_MAX_DEV == 2`, with a free-slot search on
+install and an `add → slot` lookup in the transfer callbacks, so **two MIDI
+devices run at once**. HID and serial are still single-instance: two keyboards,
+or grid + a second serial device, would need the same array-ify treatment
+(for serial, also reworking `monome.c`'s global serial backend) and that work
+isn't done.
 
 ## Control-pipe sizing: small-EP0 devices (nanoKONTROL2 fix)
 

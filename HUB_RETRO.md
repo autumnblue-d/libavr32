@@ -61,12 +61,18 @@ works.
 ## What I'd keep
 
 The end architecture was right, so don't relitigate it: porting the hub class
-driver from TinyUSB, the poll-pause/resume serialization gate, clamping
-non-isochronous pipes to 64 B at full speed, and keeping same-class
-multi-instancing (two keyboards) explicitly out of scope. The leverage insight —
-grid / keyboard / MIDI are *different* USB classes, so mixed combos need only the
-hub layer and no per-driver multi-instancing — is what kept the change small, and
-is worth leaning on again.
+driver from TinyUSB, the poll-pause/resume serialization gate, and clamping
+non-isochronous pipes to 64 B at full speed. The leverage insight — grid /
+keyboard / MIDI are *different* USB classes, so mixed combos need only the hub
+layer and no per-driver multi-instancing — is what kept the change small, and is
+worth leaning on again.
+
+Same-class multi-instancing was scoped out at first (the original plan cited "two
+keyboards" as the deferred case), but **MIDI later got it anyway** —
+`UHI_MIDI_MAX_DEV == 2`, so two MIDI devices run at once. That turned out cheap
+because MIDI's state was straightforward to array-ify; HID and serial were left
+single-instance (serial is the expensive one — it also needs `monome.c`'s global
+serial backend reworked).
 
 ## Net
 
